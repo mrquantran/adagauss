@@ -44,7 +44,7 @@ class Appr(Inc_Learning_Appr):
     def __init__(self, model, device, nepochs=200, lr=0.05, lr_min=1e-4, lr_factor=3, lr_patience=5, clipgrad=1,
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
-                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", gamma = 1.0):
+                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", gamma = 1.0, num_samples_per_old_class=5, temperature=0.1):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -64,6 +64,8 @@ class Appr(Inc_Learning_Appr):
         self.adaptation_strategy = adaptation_strategy
         self.old_model = None
         self.gamma = gamma
+        self.num_samples_per_old_class = num_samples_per_old_class
+        self.temperature = temperature
         self.pretrained = pretrained_net
         if nnet == "vit":
             state_dict = torch.load("dino_deitsmall16_pretrain.pth")
@@ -216,6 +218,10 @@ class Appr(Inc_Learning_Appr):
                             action='store_true',
                             default=False)
         parser.add_argument('--gamma', help='Weight of contrastive loss', type=float, default=1.0)
+        parser.add_argument('--num-samples-per-old-class',
+                            help='Number of samples to generate per old class',
+                            type=int,
+                            default=5)
         return parser.parse_known_args(args)
 
     def train_loop(self, t, trn_loader, val_loader):
@@ -381,7 +387,7 @@ class Appr(Inc_Learning_Appr):
                         old_covs=old_covs,
                         task_id=t,
                         temperature=0.1,
-                        num_samples_per_old_class=5
+                        num_samples_per_old_class=self.num_samples_per_old_class
                         )
                 else:
                     con_loss = 0.0
@@ -949,52 +955,6 @@ class Appr(Inc_Learning_Appr):
             mahalanobis_per_task.append(float(mahalanobis_per_class[:, self.task_offset[i]:self.task_offset[i+1]].mean()))
 
         print(f"Mahalanobis per task: {list(mahalanobis_per_task)}")
-
-def sup_con_loss(features, temperature=0.1, labels=None, mask=None):
-    device = (torch.device('cuda') if features.is_cuda else torch.device('cpu'))
-    features_norm = F.normalize(features, p=2, dim=1)  # Normalize features
-    batch_size = features_norm.shape[0]
-
-    # Validate inputs
-    if labels is not None and mask is not None:
-        raise ValueError('Cannot define both `labels` and `mask`')
-    elif labels is None and mask is None:
-        mask = torch.eye(batch_size, dtype=torch.float32).to(device)  # Self-contrast
-    elif labels is not None:
-        labels = labels.contiguous().view(-1, 1)
-        if labels.shape[0] != batch_size:
-            raise ValueError('Num of labels does not match num of features')
-        mask = torch.eq(labels, labels.T).float().to(device)  # Positive pairs mask
-    else:
-        mask = mask.float().to(device)
-
-    # Compute similarity logits
-    anchor_dot_contrast = torch.div(
-        torch.matmul(features_norm, features_norm.T), temperature)
-    logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
-    logits = anchor_dot_contrast - logits_max.detach()  # Numerical stability
-    exp_logits = torch.exp(logits)
-
-    # Masks for positives and negatives
-    logits_mask = torch.ones_like(mask).to(device) - torch.eye(batch_size).to(device)
-    positives_mask = mask * logits_mask  # Exclude self
-    negatives_mask = 1. - mask
-
-    # Compute log probabilities
-    num_positives_per_row = torch.sum(positives_mask, axis=1)
-    denominator = torch.sum(exp_logits * negatives_mask, axis=1, keepdims=True) + \
-                  torch.sum(exp_logits * positives_mask, axis=1, keepdims=True)
-    log_probs = logits - torch.log(denominator)
-
-    # Handle edge cases
-    if torch.any(torch.isnan(log_probs)):
-        raise ValueError("Log_prob has nan!")
-
-    # Compute loss only where positives exist
-    log_probs = torch.sum(log_probs * positives_mask, axis=1)[num_positives_per_row > 0] / \
-                num_positives_per_row[num_positives_per_row > 0]
-    loss = -log_probs.mean()
-    return loss
 
 def compute_rotations(images, targets, total_classes):
     # compute self-rotation for the first task following PASS https://github.com/Impression2805/CVPR21_PASS
