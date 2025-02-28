@@ -44,7 +44,7 @@ class Appr(Inc_Learning_Appr):
     def __init__(self, model, device, nepochs=200, lr=0.05, lr_min=1e-4, lr_factor=3, lr_patience=5, clipgrad=1,
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
-                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", gamma = 1.0):
+                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", gamma = 1.0, num_samples_per_old_class=5, temperature=0.1):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -64,6 +64,8 @@ class Appr(Inc_Learning_Appr):
         self.adaptation_strategy = adaptation_strategy
         self.old_model = None
         self.gamma = gamma
+        self.num_samples_per_old_class = num_samples_per_old_class
+        self.temperature = temperature
         self.pretrained = pretrained_net
         if nnet == "vit":
             state_dict = torch.load("dino_deitsmall16_pretrain.pth")
@@ -216,6 +218,10 @@ class Appr(Inc_Learning_Appr):
                             action='store_true',
                             default=False)
         parser.add_argument('--gamma', help='Weight of contrastive loss', type=float, default=1.0)
+        parser.add_argument('--num-samples-per-old-class',
+                            help='Number of samples to generate per old class',
+                            type=int,
+                            default=5)
         return parser.parse_known_args(args)
 
     def train_loop(self, t, trn_loader, val_loader):
@@ -381,7 +387,7 @@ class Appr(Inc_Learning_Appr):
                         old_covs=old_covs,
                         task_id=t,
                         temperature=0.1,
-                        num_samples_per_old_class=5
+                        num_samples_per_old_class=self.num_samples_per_old_class
                         )
                 else:
                     con_loss = 0.0
