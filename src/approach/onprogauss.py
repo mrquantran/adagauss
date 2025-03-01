@@ -377,20 +377,22 @@ class Appr(Inc_Learning_Appr):
                 optimizer.zero_grad()
                 features = self.model(images)
 
-                if t >= 0:  # Applicable for all tasks
-                    old_means = self.means[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
-                    old_covs = self.covs[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
-                    con_loss = self.contrastive_loss(
-                        current_features=features,
-                        current_labels=targets,
-                        old_means=old_means,
-                        old_covs=old_covs,
-                        task_id=t,
-                        temperature=0.1,
-                        num_samples_per_old_class=self.num_samples_per_old_class
-                        )
-                else:
-                    con_loss = 0.0
+                con_loss = sup_con_loss(features, labels=targets, temperature=0.1)
+
+                # if t >= 0:  # Applicable for all tasks
+                #     old_means = self.means[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                #     old_covs = self.covs[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                #     con_loss = self.contrastive_loss(
+                #         current_features=features,
+                #         current_labels=targets,
+                #         old_means=old_means,
+                #         old_covs=old_covs,
+                #         task_id=t,
+                #         temperature=0.1,
+                #         num_samples_per_old_class=self.num_samples_per_old_class
+                #         )
+                # else:
+                #     con_loss = 0.0
 
                 if epoch < int(self.nepochs * 0.01):
                     features = features.detach()
