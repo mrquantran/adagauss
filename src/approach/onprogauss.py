@@ -539,9 +539,11 @@ class Appr(Inc_Learning_Appr):
             adapter.train()
             train_loss, valid_loss = [], []
             train_ac, train_determinant = [], []
-            for images, _ in trn_loader:
+            for images, labels in trn_loader:
                 bsz = images.shape[0]
-                images = images.to(self.device, non_blocking=True)
+                images, labels = images.to(self.device, non_blocking=True), labels.to(
+                    self.device, non_blocking=True
+                )
                 optimizer.zero_grad()
                 with torch.no_grad():
                     target = self.model(images)
@@ -552,6 +554,20 @@ class Appr(Inc_Learning_Appr):
                 if self.alpha > 0:
                     ac, det = loss_ac(adapted_features, self.beta)
                 total_loss = loss + self.alpha * ac
+
+                old_means = self.means[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                old_covs = self.covs[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                con_loss = self.contrastive_loss(
+                    current_features=adapted_features,
+                    current_labels=labels,
+                    old_means=old_means,
+                    old_covs=old_covs,
+                    task_id=t,
+                    temperature=0.1,
+                    num_samples_per_old_class=self.num_samples_per_old_class
+                )
+                total_loss += self.gamma * con_loss
+
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1)
                 optimizer.step()
@@ -805,8 +821,6 @@ class Appr(Inc_Learning_Appr):
                 logits_per_task.append(float(logits_per_class[:, self.task_offset[i]:self.task_offset[i+1]].mean()))
 
             print(f"Logits per task: {list(logits_per_task)}")
-
-
 
     @torch.no_grad()
     def check_singular_values(self, t, val_loader):
