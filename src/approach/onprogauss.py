@@ -964,49 +964,55 @@ def compute_rotations(images, targets, total_classes):
     targets = torch.cat((targets, target_rot))
     return images, targets
 
-def sup_con_loss(features, labels, temperature=0.1):
-    """
-    Supervised contrastive loss (SupCon).
 
-    Args:
-        features (Tensor): Normalized features [num_samples, feature_dim]
-        labels (Tensor): Labels [num_samples]
-        temperature (float): Temperature scaling
+def sup_con_loss(features, labels=None, mask=None, temperature=0.1):
+    device = torch.device("cuda") if features.is_cuda else torch.device("cpu")
+    features_norm = F.normalize(features, p=2, dim=1)
+    batch_size = features_norm.shape[0]
 
-    Returns:
-        Tensor: Scalar loss
-    """
-    device = features.device
-    batch_size = features.size(0)
-    if batch_size <= 1:
-        return torch.tensor(0.0, device=device)
+    if labels is not None and mask is not None:
+        raise ValueError("Cannot define both `labels` and `mask`")
+    elif labels is None and mask is None:
+        mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+    elif labels is not None:
+        labels = labels.contiguous().view(-1, 1)
+        if labels.shape[0] != batch_size:
+            raise ValueError("Num of labels does not match num of features")
+        mask = torch.eq(labels, labels.T).float().to(device)
+    else:
+        mask = mask.float().to(device)
 
-    # Compute similarity matrix
-    sim_matrix = torch.matmul(features, features.T) / temperature
+    # compute logits
+    anchor_dot_contrast = torch.div(
+        torch.matmul(features_norm, features_norm.T), temperature
+    )
+    # for numerical stability
+    logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+    logits = anchor_dot_contrast - logits_max.detach()
+    exp_logits = torch.exp(logits)
 
-    # Create mask for positive pairs (same class, excluding self)
-    mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
-    mask = mask - torch.eye(batch_size, device=device)  # Remove self-similarity
-    pos_mask = mask.clone()
-    pos_mask[pos_mask < 0] = 0  # Ensure non-negative
+    logits_mask = torch.ones_like(mask).to(device) - torch.eye(batch_size).to(device)
+    positives_mask = mask * logits_mask
+    negatives_mask = 1.0 - mask
 
-    # Compute positive and negative terms
-    exp_sim = torch.exp(sim_matrix)
-    pos_sum = (exp_sim * pos_mask).sum(dim=1)  # Sum of positives per anchor
-    neg_sum = exp_sim.sum(dim=1) - exp_sim.diag()  # Total sum excluding self
+    num_positives_per_row = torch.sum(positives_mask, axis=1)
+    denominator = torch.sum(
+        exp_logits * negatives_mask, axis=1, keepdims=True
+    ) + torch.sum(exp_logits * positives_mask, axis=1, keepdims=True)
 
-    # Avoid division by zero
-    pos_sum = torch.where(pos_sum > 0, pos_sum, torch.ones_like(pos_sum) * 1e-6)
-    neg_sum = torch.where(neg_sum > 0, neg_sum, torch.ones_like(neg_sum) * 1e-6)
+    log_probs = logits - torch.log(denominator)
+    if torch.any(torch.isnan(log_probs)):
+        raise ValueError("Log_prob has nan!")
 
-    # Loss per anchor: -log(pos/neg)
-    loss = -torch.log(pos_sum / neg_sum)
+    log_probs = (
+        torch.sum(log_probs * positives_mask, axis=1)[num_positives_per_row > 0]
+        / num_positives_per_row[num_positives_per_row > 0]
+    )
 
-    # Mask out anchors with no positives
-    valid = (pos_mask.sum(dim=1) > 0).float()
-    loss = loss * valid
-
-    return loss.sum() / (valid.sum() + 1e-6)
+    # loss
+    loss = -log_probs
+    loss = loss.mean()
+    return loss
 
 def loss_ac(features, beta):
     cov = torch.cov(features.T)
@@ -1016,4 +1022,3 @@ def loss_ac(features, beta):
     # if bool(torch.isinf(loss)) or bool(torch.isnan(loss)):
     #     return torch.tensor(7777.), torch.tensor(0.)
     return loss, torch.det(cov)
-
