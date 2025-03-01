@@ -560,7 +560,7 @@ class Appr(Inc_Learning_Appr):
                 else:
                     ac, det = 0, torch.tensor(0)
 
-                total_loss += self.gacr_weight * con_loss
+                total_loss += self.gamma * con_loss
 
                 # Backpropagation
                 total_loss.backward()
