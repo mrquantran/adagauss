@@ -23,7 +23,8 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 
 
 class SampledDataset(torch.utils.data.Dataset):
-    """ Dataset that samples pseudo prototypes from memorized distributions to train pseudo head """
+    """Dataset that samples pseudo prototypes from memorized distributions to train pseudo head"""
+
     def __init__(self, distributions, samples, task_offset):
         self.distributions = distributions
         self.samples = samples
@@ -33,7 +34,7 @@ class SampledDataset(torch.utils.data.Dataset):
         return self.samples
 
     def __getitem__(self, index):
-        target = random.randint(0, self.total_classes-1)
+        target = random.randint(0, self.total_classes - 1)
         val = self.distributions[target].sample()
         return val, target
 
@@ -41,13 +42,72 @@ class SampledDataset(torch.utils.data.Dataset):
 class Appr(Inc_Learning_Appr):
     """Class implementing AdaGauss algorithm"""
 
-    def __init__(self, model, device, nepochs=200, lr=0.05, lr_min=1e-4, lr_factor=3, lr_patience=5, clipgrad=1,
-                 momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
-                 logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False, rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
-                 adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes", gamma = 1.0, num_samples_per_old_class=5, temperature=0.1):
-        super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
-                                   multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
-                                   exemplars_dataset=None)
+    def __init__(
+        self,
+        model,
+        device,
+        nepochs=200,
+        lr=0.05,
+        lr_min=1e-4,
+        lr_factor=3,
+        lr_patience=5,
+        clipgrad=1,
+        momentum=0,
+        wd=0,
+        multi_softmax=False,
+        wu_nepochs=0,
+        wu_lr_factor=1,
+        nnet="resnet18",
+        patience=5,
+        fix_bn=False,
+        eval_on_train=False,
+        logger=None,
+        N=10000,
+        alpha=1.0,
+        lr_backbone=0.01,
+        lr_adapter=0.01,
+        beta=1.0,
+        distillation="projected",
+        use_224=False,
+        S=64,
+        dump=False,
+        rotation=False,
+        distiller="linear",
+        adapter="linear",
+        criterion="proxy-nca",
+        lamb=10,
+        tau=2,
+        smoothing=0.0,
+        sval_fraction=0.95,
+        adaptation_strategy="full",
+        pretrained_net=False,
+        normalize=False,
+        shrink=0.0,
+        multiplier=32,
+        classifier="bayes",
+        gamma=1.0,
+        num_samples_per_old_class=5,
+        temperature=0.1,
+    ):
+        super(Appr, self).__init__(
+            model,
+            device,
+            nepochs,
+            lr,
+            lr_min,
+            lr_factor,
+            lr_patience,
+            clipgrad,
+            momentum,
+            wd,
+            multi_softmax,
+            wu_nepochs,
+            wu_lr_factor,
+            fix_bn,
+            eval_on_train,
+            logger,
+            exemplars_dataset=None,
+        )
 
         self.N = N
         self.S = S
@@ -91,7 +151,9 @@ class Appr(Inc_Learning_Appr):
         self.train_data_loaders, self.val_data_loaders = [], []
         self.means = torch.empty((0, self.S), device=self.device)
         self.covs = torch.empty((0, self.S, self.S), device=self.device)
-        self.covs_raw = torch.empty((0, self.S, self.S), device=self.device)  # not shrinked, not adapted
+        self.covs_raw = torch.empty(
+            (0, self.S, self.S), device=self.device
+        )  # not shrinked, not adapted
         self.covs_inverted = None
         self.classifier = classifier
         self.pseudo_head = None
@@ -100,9 +162,9 @@ class Appr(Inc_Learning_Appr):
         self.task_offset = [0]
         self.classes_in_tasks = []
         self.criterion_type = criterion
-        self.criterion = {"proxy-yolo": ProxyYolo,
-                          "proxy-nca": ProxyNCA,
-                          "ce": CE}[criterion]
+        self.criterion = {"proxy-yolo": ProxyYolo, "proxy-nca": ProxyNCA, "ce": CE}[
+            criterion
+        ]
         self.heads = torch.nn.ModuleList()
         self.sval_fraction = sval_fraction
         self.svals_explained_by = []
@@ -114,114 +176,130 @@ class Appr(Inc_Learning_Appr):
     def extra_parser(args):
         """Returns a parser containing the approach specific parameters"""
         parser = ArgumentParser()
-        parser.add_argument('--N',
-                            help='Number of samples to adapt cov',
-                            type=int,
-                            default=10000)
-        parser.add_argument('--S',
-                            help='latent space size',
-                            type=int,
-                            default=64)
-        parser.add_argument('--alpha',
-                            help='Weight of anti-collapse loss',
-                            type=float,
-                            default=1.0)
-        parser.add_argument('--beta',
-                            help='Anti-collapse loss clamp',
-                            type=float,
-                            default=1.0)
-        parser.add_argument('--lamb',
-                            help='Weight of kd loss',
-                            type=float,
-                            default=10)
-        parser.add_argument('--lr-backbone',
-                            help='lr for backbone of the pretrained model',
-                            type=float,
-                            default=0.01)
-        parser.add_argument('--lr-adapter',
-                            help='lr for backbone of the adapter',
-                            type=float,
-                            default=0.01)
-        parser.add_argument('--multiplier',
-                            help='mlp multiplier',
-                            type=int,
-                            default=32)
-        parser.add_argument('--tau',
-                            help='temperature for logit distill',
-                            type=float,
-                            default=2)
-        parser.add_argument('--shrink',
-                            help='shrink during training',
-                            type=float,
-                            default=0)
-        parser.add_argument('--sval-fraction',
-                            help='Fraction of eigenvalues sum that is explained',
-                            type=float,
-                            default=0.95)
-        parser.add_argument('--adaptation-strategy',
-                            help='Activation functions in resnet',
-                            type=str,
-                            choices=["none", "mean", "diag", "full"],
-                            default="full")
-        parser.add_argument('--distiller',
-                            help='Distiller',
-                            type=str,
-                            choices=["linear", "mlp"],
-                            default="mlp")
-        parser.add_argument('--adapter',
-                            help='Adapter',
-                            type=str,
-                            choices=["linear", "mlp"],
-                            default="mlp")
-        parser.add_argument('--criterion',
-                            help='Loss function',
-                            type=str,
-                            choices=["ce", "proxy-nca", "proxy-yolo"],
-                            default="ce")
-        parser.add_argument('--nnet',
-                            help='Type of neural network',
-                            type=str,
-                            choices=["vit", "resnet18", "resnet32"],
-                            default="resnet18")
-        parser.add_argument('--classifier',
-                            help='Classifier type',
-                            type=str,
-                            choices=["linear", "bayes", "nmc"],
-                            default="bayes")
-        parser.add_argument('--distillation',
-                            help='Loss function',
-                            type=str,
-                            choices=["projected", "logit", "feature", "none"],
-                            default="projected")
-        parser.add_argument('--smoothing',
-                            help='label smoothing',
-                            type=float,
-                            default=0.0)
-        parser.add_argument('--use-224',
-                            help='Additional max pool and different conv1 in Resnet18',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--pretrained-net',
-                            help='Load pretrained weights',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--normalize',
-                            help='normalize features and covariance matrices',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--dump',
-                            help='save checkpoints',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--rotation',
-                            help='Rotate images in the first task to enhance feature extractor',
-                            action='store_true',
-                            default=False)
-        parser.add_argument('--gamma', help='Weight of contrastive loss', type=float, default=1.0)
-        parser.add_argument('--num-samples-per-old-class',
-                            help='Number of samples to generate per old class',
-                            type=int,
-                            default=5)
+        parser.add_argument(
+            "--N", help="Number of samples to adapt cov", type=int, default=10000
+        )
+        parser.add_argument("--S", help="latent space size", type=int, default=64)
+        parser.add_argument(
+            "--alpha", help="Weight of anti-collapse loss", type=float, default=1.0
+        )
+        parser.add_argument(
+            "--beta", help="Anti-collapse loss clamp", type=float, default=1.0
+        )
+        parser.add_argument("--lamb", help="Weight of kd loss", type=float, default=10)
+        parser.add_argument(
+            "--lr-backbone",
+            help="lr for backbone of the pretrained model",
+            type=float,
+            default=0.01,
+        )
+        parser.add_argument(
+            "--lr-adapter",
+            help="lr for backbone of the adapter",
+            type=float,
+            default=0.01,
+        )
+        parser.add_argument("--multiplier", help="mlp multiplier", type=int, default=32)
+        parser.add_argument(
+            "--tau", help="temperature for logit distill", type=float, default=2
+        )
+        parser.add_argument(
+            "--shrink", help="shrink during training", type=float, default=0
+        )
+        parser.add_argument(
+            "--sval-fraction",
+            help="Fraction of eigenvalues sum that is explained",
+            type=float,
+            default=0.95,
+        )
+        parser.add_argument(
+            "--adaptation-strategy",
+            help="Activation functions in resnet",
+            type=str,
+            choices=["none", "mean", "diag", "full"],
+            default="full",
+        )
+        parser.add_argument(
+            "--distiller",
+            help="Distiller",
+            type=str,
+            choices=["linear", "mlp"],
+            default="mlp",
+        )
+        parser.add_argument(
+            "--adapter",
+            help="Adapter",
+            type=str,
+            choices=["linear", "mlp"],
+            default="mlp",
+        )
+        parser.add_argument(
+            "--criterion",
+            help="Loss function",
+            type=str,
+            choices=["ce", "proxy-nca", "proxy-yolo"],
+            default="ce",
+        )
+        parser.add_argument(
+            "--nnet",
+            help="Type of neural network",
+            type=str,
+            choices=["vit", "resnet18", "resnet32"],
+            default="resnet18",
+        )
+        parser.add_argument(
+            "--classifier",
+            help="Classifier type",
+            type=str,
+            choices=["linear", "bayes", "nmc"],
+            default="bayes",
+        )
+        parser.add_argument(
+            "--distillation",
+            help="Loss function",
+            type=str,
+            choices=["projected", "logit", "feature", "none"],
+            default="projected",
+        )
+        parser.add_argument(
+            "--smoothing", help="label smoothing", type=float, default=0.0
+        )
+        parser.add_argument(
+            "--use-224",
+            help="Additional max pool and different conv1 in Resnet18",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--pretrained-net",
+            help="Load pretrained weights",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--normalize",
+            help="normalize features and covariance matrices",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--dump", help="save checkpoints", action="store_true", default=False
+        )
+        parser.add_argument(
+            "--rotation",
+            help="Rotate images in the first task to enhance feature extractor",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--gamma", help="Weight of contrastive loss", type=float, default=1.0
+        )
+        parser.add_argument(
+            "--num-samples-per-old-class",
+            help="Number of samples to generate per old class",
+            type=int,
+            default=5,
+        )
         return parser.parse_known_args(args)
 
     def train_loop(self, t, trn_loader, val_loader):
@@ -248,7 +326,9 @@ class Appr(Inc_Learning_Appr):
         covs = self.covs.clone()
         print(f"Cov matrix det: {torch.linalg.det(covs)}")
         for i in range(covs.shape[0]):
-            print(f"Rank for class {i}: {torch.linalg.matrix_rank(self.covs_raw[i], tol=0.01)}, {torch.linalg.matrix_rank(self.covs[i], tol=0.01)}")
+            print(
+                f"Rank for class {i}: {torch.linalg.matrix_rank(self.covs_raw[i], tol=0.01)}, {torch.linalg.matrix_rank(self.covs[i], tol=0.01)}"
+            )
             covs[i] = self.shrink_cov(covs[i], 3)
         if self.is_normalization:
             covs = self.norm_cov(covs)
@@ -285,7 +365,16 @@ class Appr(Inc_Learning_Appr):
             labels.append(torch.full((num_samples_per_class,), i, device=mean.device))
         return torch.cat(samples, dim=0), torch.cat(labels, dim=0)
 
-    def contrastive_loss(self, current_features, current_labels, old_means, old_covs, task_id, temperature=0.1, num_samples_per_old_class=5):
+    def contrastive_loss(
+        self,
+        current_features,
+        current_labels,
+        old_means,
+        old_covs,
+        task_id,
+        temperature=0.1,
+        num_samples_per_old_class=5,
+    ):
         """
         Compute contrastive loss combining current task instances and old task prototypes.
 
@@ -308,7 +397,9 @@ class Appr(Inc_Learning_Appr):
 
         # Instance-level contrastive loss for current task
         if current_features.size(0) > 1:
-            current_loss = sup_con_loss(current_features_norm, labels=current_labels, temperature=temperature)
+            current_loss = sup_con_loss(
+                current_features_norm, labels=current_labels, temperature=temperature
+            )
         else:
             current_loss = torch.tensor(0.0, device=device)
 
@@ -325,43 +416,94 @@ class Appr(Inc_Learning_Appr):
             all_labels = torch.cat([current_labels, old_labels], dim=0)
 
             # Compute full contrastive loss
-            total_loss = sup_con_loss(all_features, labels=all_labels, temperature=temperature)
+            total_loss = sup_con_loss(
+                all_features, labels=all_labels, temperature=temperature
+            )
         else:
             total_loss = current_loss
 
         return total_loss
 
     def train_backbone(self, t, trn_loader, val_loader, num_classes_in_t):
-        trn_loader = torch.utils.data.DataLoader(trn_loader.dataset, batch_size=trn_loader.batch_size, num_workers=trn_loader.num_workers, shuffle=True, drop_last=True)
-        val_loader = torch.utils.data.DataLoader(val_loader.dataset, batch_size=val_loader.batch_size, num_workers=val_loader.num_workers, shuffle=False, drop_last=True)
-        print(f'The model has {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters')
-        print(f'The expert has {sum(p.numel() for p in self.model.parameters() if not p.requires_grad):,} shared parameters\n')
+        trn_loader = torch.utils.data.DataLoader(
+            trn_loader.dataset,
+            batch_size=trn_loader.batch_size,
+            num_workers=trn_loader.num_workers,
+            shuffle=True,
+            drop_last=True,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_loader.dataset,
+            batch_size=val_loader.batch_size,
+            num_workers=val_loader.num_workers,
+            shuffle=False,
+            drop_last=True,
+        )
+        print(
+            f"The model has {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,} trainable parameters"
+        )
+        print(
+            f"The expert has {sum(p.numel() for p in self.model.parameters() if not p.requires_grad):,} shared parameters\n"
+        )
         distiller = nn.Linear(self.S, self.S)
         if self.distiller_type == "mlp":
-            distiller = nn.Sequential(nn.Linear(self.S, self.multiplier * self.S),
-                                      nn.GELU(),
-                                      nn.Linear(self.multiplier * self.S, self.S)
-                                      )
+            distiller = nn.Sequential(
+                nn.Linear(self.S, self.multiplier * self.S),
+                nn.GELU(),
+                nn.Linear(self.multiplier * self.S, self.S),
+            )
 
         distiller.to(self.device, non_blocking=True)
-        criterion = self.criterion(num_classes_in_t, self.S, self.device, smoothing=self.smoothing)
+        criterion = self.criterion(
+            num_classes_in_t, self.S, self.device, smoothing=self.smoothing
+        )
         if t == 0 and self.is_rotation:
-            criterion = self.criterion(4*num_classes_in_t, self.S, self.device, smoothing=self.smoothing)
-            trn_loader = torch.utils.data.DataLoader(trn_loader.dataset, batch_size=trn_loader.batch_size // 4, num_workers=trn_loader.num_workers, shuffle=True, drop_last=True)
-            val_loader = torch.utils.data.DataLoader(val_loader.dataset, batch_size=val_loader.batch_size // 4, num_workers=val_loader.num_workers, shuffle=False, drop_last=True)
+            criterion = self.criterion(
+                4 * num_classes_in_t, self.S, self.device, smoothing=self.smoothing
+            )
+            trn_loader = torch.utils.data.DataLoader(
+                trn_loader.dataset,
+                batch_size=trn_loader.batch_size // 4,
+                num_workers=trn_loader.num_workers,
+                shuffle=True,
+                drop_last=True,
+            )
+            val_loader = torch.utils.data.DataLoader(
+                val_loader.dataset,
+                batch_size=val_loader.batch_size // 4,
+                num_workers=val_loader.num_workers,
+                shuffle=False,
+                drop_last=True,
+            )
         self.heads.eval()
         old_heads = copy.deepcopy(self.heads)
-        parameters = list(self.model.parameters()) + list(criterion.parameters()) + list(distiller.parameters()) + list(self.heads.parameters())
+        parameters = (
+            list(self.model.parameters())
+            + list(criterion.parameters())
+            + list(distiller.parameters())
+            + list(self.heads.parameters())
+        )
         parameters_dict = [
             {"params": list(self.model.parameters())[:-1], "lr": self.lr_backbone},
-            {"params": list(criterion.parameters()) + list(self.model.parameters())[-1:]},
+            {
+                "params": list(criterion.parameters())
+                + list(self.model.parameters())[-1:]
+            },
             {"params": list(distiller.parameters())},
             {"params": list(self.heads.parameters())},
         ]
-        optimizer, lr_scheduler = self.get_optimizer(parameters_dict if self.pretrained else parameters, t, self.wd)
+        optimizer, lr_scheduler = self.get_optimizer(
+            parameters_dict if self.pretrained else parameters, t, self.wd
+        )
 
         for epoch in range(self.nepochs):
-            train_loss, train_kd_loss, train_con_loss, valid_loss, valid_kd_loss = [], [], [], [], []
+            train_loss, train_kd_loss, train_con_loss, valid_loss, valid_kd_loss = (
+                [],
+                [],
+                [],
+                [],
+                [],
+            )
             train_ac, train_determinant = [], []
             train_hits, val_hits, train_total, val_total = 0, 0, 0, 0
             self.model.train()
@@ -369,17 +511,29 @@ class Appr(Inc_Learning_Appr):
             distiller.train()
             for images, targets in trn_loader:
                 if t == 0 and self.is_rotation:
-                    images, targets = compute_rotations(images, targets, num_classes_in_t)
+                    images, targets = compute_rotations(
+                        images, targets, num_classes_in_t
+                    )
                 targets -= self.task_offset[t]
                 bsz = images.shape[0]
                 train_total += bsz
-                images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
+                images, targets = images.to(self.device, non_blocking=True), targets.to(
+                    self.device, non_blocking=True
+                )
                 optimizer.zero_grad()
                 features = self.model(images)
 
                 # =========== Contrastive loss ===========
-                old_means = self.means[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
-                old_covs = self.covs[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                old_means = (
+                    self.means[: self.task_offset[t]]
+                    if t > 0
+                    else torch.tensor([], device=self.device)
+                )
+                old_covs = (
+                    self.covs[: self.task_offset[t]]
+                    if t > 0
+                    else torch.tensor([], device=self.device)
+                )
                 con_loss = self.contrastive_loss(
                     current_features=features,
                     current_labels=targets,
@@ -387,21 +541,27 @@ class Appr(Inc_Learning_Appr):
                     old_covs=old_covs,
                     task_id=t,
                     temperature=0.1,
-                    num_samples_per_old_class=self.num_samples_per_old_class
-                    )
+                    num_samples_per_old_class=self.num_samples_per_old_class,
+                )
 
                 if epoch < int(self.nepochs * 0.01):
                     features = features.detach()
                 loss, logits = criterion(features, targets)
 
                 if self.distillation == "logit":
-                    total_loss, kd_loss = self.distill_logits(t, loss, features, images, old_heads)
+                    total_loss, kd_loss = self.distill_logits(
+                        t, loss, features, images, old_heads
+                    )
                 elif self.distillation == "projected":
-                    total_loss, kd_loss = self.distill_projected(t, loss, features, distiller, images)
+                    total_loss, kd_loss = self.distill_projected(
+                        t, loss, features, distiller, images
+                    )
                 elif self.distillation == "feature":
-                    total_loss, kd_loss = self.distill_features(t, loss, features, images)
+                    total_loss, kd_loss = self.distill_features(
+                        t, loss, features, images
+                    )
                 else:  # no distillation
-                    total_loss, kd_loss = loss, 0.
+                    total_loss, kd_loss = loss, 0.0
 
                 ac, det = 0, torch.tensor(0)
                 if self.alpha > 0:
@@ -416,7 +576,9 @@ class Appr(Inc_Learning_Appr):
                 optimizer.step()
 
                 if logits is not None:
-                    train_hits += float(torch.sum((torch.argmax(logits, dim=1) == targets)))
+                    train_hits += float(
+                        torch.sum((torch.argmax(logits, dim=1) == targets))
+                    )
                 train_loss.append(float(bsz * loss))
                 train_ac.append(float(ac))
                 train_determinant.append(float(torch.clamp(torch.abs(det), max=1e8)))
@@ -433,24 +595,36 @@ class Appr(Inc_Learning_Appr):
                 with torch.no_grad():
                     for images, targets in val_loader:
                         if t == 0 and self.is_rotation:
-                            images, targets = compute_rotations(images, targets, num_classes_in_t)
+                            images, targets = compute_rotations(
+                                images, targets, num_classes_in_t
+                            )
                         targets -= self.task_offset[t]
                         bsz = images.shape[0]
                         val_total += bsz
-                        images, targets = images.to(self.device, non_blocking=True), targets.to(self.device, non_blocking=True)
+                        images, targets = images.to(
+                            self.device, non_blocking=True
+                        ), targets.to(self.device, non_blocking=True)
                         features = self.model(images)
                         loss, logits = criterion(features, targets)
                         if self.distillation == "logit":
-                            _, kd_loss = self.distill_logits(t, loss, features, images, old_heads)
+                            _, kd_loss = self.distill_logits(
+                                t, loss, features, images, old_heads
+                            )
                         elif self.distillation == "projected":
-                            _, kd_loss = self.distill_projected(t, loss, features, distiller, images)
+                            _, kd_loss = self.distill_projected(
+                                t, loss, features, distiller, images
+                            )
                         elif self.distillation == "feature":
-                            _, kd_loss = self.distill_features(t, loss, features, images)
+                            _, kd_loss = self.distill_features(
+                                t, loss, features, images
+                            )
                         else:  # no distillation
-                            kd_loss = 0.
+                            kd_loss = 0.0
 
                         if logits is not None:
-                            val_hits += float(torch.sum((torch.argmax(logits, dim=1) == targets)))
+                            val_hits += float(
+                                torch.sum((torch.argmax(logits, dim=1) == targets))
+                            )
                         valid_loss.append(float(bsz * loss))
                         valid_kd_loss.append(float(bsz * kd_loss))
 
@@ -464,40 +638,50 @@ class Appr(Inc_Learning_Appr):
             train_acc = train_hits / train_total
             val_acc = val_hits / val_total
 
-            print(f"Epoch: {epoch} Train: {train_loss:.2f} Con: {train_con_loss:.3f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
-                  f"Val: {valid_loss:.2f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}")
+            print(
+                f"Epoch: {epoch} Train: {train_loss:.2f} Con: {train_con_loss:.3f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
+                f"Val: {valid_loss:.2f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}"
+            )
 
         if self.distillation == "logit":
             self.heads.append(criterion.head)
 
     @torch.no_grad()
     def create_distributions(self, t, trn_loader, val_loader, num_classes_in_t):
-        """ Creating distributions for task t"""
+        """Creating distributions for task t"""
         self.model.eval()
         transforms = val_loader.dataset.transform
         new_means = torch.zeros((num_classes_in_t, self.S), device=self.device)
         new_covs = torch.zeros((num_classes_in_t, self.S, self.S), device=self.device)
-        new_covs_not_shrinked = torch.zeros((num_classes_in_t, self.S, self.S), device=self.device)
+        new_covs_not_shrinked = torch.zeros(
+            (num_classes_in_t, self.S, self.S), device=self.device
+        )
         # svals_task = torch.full((10, self.S), fill_value=0., device=self.device)
         for c in range(num_classes_in_t):
-            train_indices = torch.tensor(trn_loader.dataset.labels) == c + self.task_offset[t]
+            train_indices = (
+                torch.tensor(trn_loader.dataset.labels) == c + self.task_offset[t]
+            )
             if isinstance(trn_loader.dataset.images, list):
                 train_images = list(compress(trn_loader.dataset.images, train_indices))
                 ds = ClassDirectoryDataset(train_images, transforms)
             else:
                 ds = trn_loader.dataset.images[train_indices]
                 ds = ClassMemoryDataset(ds, transforms)
-            loader = torch.utils.data.DataLoader(ds, batch_size=128, num_workers=trn_loader.num_workers, shuffle=False)
+            loader = torch.utils.data.DataLoader(
+                ds, batch_size=128, num_workers=trn_loader.num_workers, shuffle=False
+            )
             from_ = 0
-            class_features = torch.full((2 * len(ds), self.S), fill_value=0., device=self.device)
+            class_features = torch.full(
+                (2 * len(ds), self.S), fill_value=0.0, device=self.device
+            )
             for images in loader:
                 bsz = images.shape[0]
                 images = images.to(self.device, non_blocking=True)
                 features = self.model(images)
-                class_features[from_: from_+bsz] = features
+                class_features[from_ : from_ + bsz] = features
                 features = self.model(torch.flip(images, dims=(3,)))
-                class_features[from_+bsz: from_+2*bsz] = features
-                from_ += 2*bsz
+                class_features[from_ + bsz : from_ + 2 * bsz] = features
+                from_ += 2 * bsz
 
             # svals = torch.linalg.svdvals(class_features)
             # torch.sort(svals, descending=True)
@@ -519,16 +703,29 @@ class Appr(Inc_Learning_Appr):
         self.covs_raw = torch.cat((self.covs_raw, new_covs_not_shrinked), dim=0)
 
     def adapt_distributions(self, t, trn_loader, val_loader):
-        trn_loader = torch.utils.data.DataLoader(trn_loader.dataset, batch_size=trn_loader.batch_size, num_workers=trn_loader.num_workers, shuffle=True, drop_last=True)
-        val_loader = torch.utils.data.DataLoader(val_loader.dataset, batch_size=val_loader.batch_size, num_workers=val_loader.num_workers, shuffle=False, drop_last=True)
+        trn_loader = torch.utils.data.DataLoader(
+            trn_loader.dataset,
+            batch_size=trn_loader.batch_size,
+            num_workers=trn_loader.num_workers,
+            shuffle=True,
+            drop_last=True,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_loader.dataset,
+            batch_size=val_loader.batch_size,
+            num_workers=val_loader.num_workers,
+            shuffle=False,
+            drop_last=True,
+        )
         # Train the adapter
         self.model.eval()
         adapter = nn.Linear(self.S, self.S)
         if self.adapter_type == "mlp":
-            adapter = nn.Sequential(nn.Linear(self.S, self.multiplier * self.S),
-                                    nn.GELU(),
-                                    nn.Linear(self.multiplier * self.S, self.S)
-                                    )
+            adapter = nn.Sequential(
+                nn.Linear(self.S, self.multiplier * self.S),
+                nn.GELU(),
+                nn.Linear(self.multiplier * self.S, self.S),
+            )
         adapter.to(self.device, non_blocking=True)
         # state_dict = torch.load(f"../ckpts/adapter_{t}.pth")
         # adapter.load_state_dict(state_dict, strict=True)
@@ -555,8 +752,16 @@ class Appr(Inc_Learning_Appr):
                     ac, det = loss_ac(adapted_features, self.beta)
                 total_loss = loss + self.alpha * ac
 
-                old_means = self.means[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
-                old_covs = self.covs[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                old_means = (
+                    self.means[: self.task_offset[t]]
+                    if t > 0
+                    else torch.tensor([], device=self.device)
+                )
+                old_covs = (
+                    self.covs[: self.task_offset[t]]
+                    if t > 0
+                    else torch.tensor([], device=self.device)
+                )
                 con_loss = self.contrastive_loss(
                     current_features=adapted_features,
                     current_labels=labels,
@@ -564,7 +769,7 @@ class Appr(Inc_Learning_Appr):
                     old_covs=old_covs,
                     task_id=t,
                     temperature=0.1,
-                    num_samples_per_old_class=self.num_samples_per_old_class
+                    num_samples_per_old_class=self.num_samples_per_old_class,
                 )
                 total_loss += self.gamma * con_loss
 
@@ -585,14 +790,18 @@ class Appr(Inc_Learning_Appr):
                         target = self.model(images)
                         old_features = self.old_model(images)
                         adapted_features = adapter(old_features)
-                        total_loss = torch.nn.functional.mse_loss(adapted_features, target)
+                        total_loss = torch.nn.functional.mse_loss(
+                            adapted_features, target
+                        )
                         valid_loss.append(float(bsz * total_loss))
 
             train_loss = sum(train_loss) / len(trn_loader.dataset)
             train_determinant = sum(train_determinant) / len(train_determinant)
             train_ac = sum(train_ac) / len(train_ac)
             valid_loss = sum(valid_loss) / len(val_loader.dataset)
-            print(f"Epoch: {epoch} Train loss: {train_loss:.2f} Val loss: {valid_loss:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f}")
+            print(
+                f"Epoch: {epoch} Train loss: {train_loss:.2f} Val loss: {valid_loss:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f}"
+            )
 
         if self.dump:
             torch.save(adapter.state_dict(), f"{self.logger.exp_path}/adapter_{t}.pth")
@@ -619,11 +828,21 @@ class Appr(Inc_Learning_Appr):
                         self.covs[c] = torch.diag(torch.diag(self.covs[c]))
 
             print("### Adaptation evaluation ###")
-            for (subset, loaders) in [("train", self.train_data_loaders), ("val", self.val_data_loaders)]:
+            for subset, loaders in [
+                ("train", self.train_data_loaders),
+                ("val", self.val_data_loaders),
+            ]:
                 old_mean_diff, new_mean_diff = [], []
                 old_kld, new_kld = [], []
-                old_cov_diff, old_cov_norm_diff, new_cov_diff, new_cov_norm_diff = [], [], [], []
-                class_images = np.concatenate([dl.dataset.images for dl in loaders[-2:-1]])
+                old_cov_diff, old_cov_norm_diff, new_cov_diff, new_cov_norm_diff = (
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                class_images = np.concatenate(
+                    [dl.dataset.images for dl in loaders[-2:-1]]
+                )
                 labels = np.concatenate([dl.dataset.labels for dl in loaders[-2:-1]])
 
                 for c in list(np.unique(labels)):
@@ -631,20 +850,31 @@ class Appr(Inc_Learning_Appr):
 
                     if isinstance(trn_loader.dataset.images, list):
                         train_images = list(compress(class_images, train_indices))
-                        ds = ClassDirectoryDataset(train_images, val_loader.dataset.transform)
+                        ds = ClassDirectoryDataset(
+                            train_images, val_loader.dataset.transform
+                        )
                     else:
-                        ds = ClassMemoryDataset(class_images[train_indices], val_loader.dataset.transform)
-                    loader = torch.utils.data.DataLoader(ds, batch_size=128, num_workers=trn_loader.num_workers, shuffle=False)
+                        ds = ClassMemoryDataset(
+                            class_images[train_indices], val_loader.dataset.transform
+                        )
+                    loader = torch.utils.data.DataLoader(
+                        ds,
+                        batch_size=128,
+                        num_workers=trn_loader.num_workers,
+                        shuffle=False,
+                    )
                     from_ = 0
-                    class_features = torch.full((2 * len(ds), self.S), fill_value=0., device=self.device)
+                    class_features = torch.full(
+                        (2 * len(ds), self.S), fill_value=0.0, device=self.device
+                    )
                     for images in loader:
                         bsz = images.shape[0]
                         images = images.to(self.device, non_blocking=True)
                         features = self.model(images)
-                        class_features[from_: from_+bsz] = features
+                        class_features[from_ : from_ + bsz] = features
                         features = self.model(torch.flip(images, dims=(3,)))
-                        class_features[from_+bsz: from_+2*bsz] = features
-                        from_ += 2*bsz
+                        class_features[from_ + bsz : from_ + 2 * bsz] = features
+                        from_ += 2 * bsz
 
                     gt_mean = class_features.mean(0)
                     gt_cov = torch.cov(class_features.T)
@@ -656,15 +886,35 @@ class Appr(Inc_Learning_Appr):
                     # Calculate old diffs
                     old_mean_diff.append((gt_mean - old_means[c]).norm())
                     old_cov_diff.append(torch.norm(gt_cov - old_covs[c]))
-                    old_cov_norm_diff.append(torch.norm(self.norm_cov(gt_cov.unsqueeze(0)) - self.norm_cov(old_covs[c].unsqueeze(0))))
-                    old_gauss = torch.distributions.MultivariateNormal(old_means[c], old_covs[c])
-                    old_kld.append(torch.distributions.kl_divergence(old_gauss, gt_gauss) + torch.distributions.kl_divergence(gt_gauss, old_gauss))
+                    old_cov_norm_diff.append(
+                        torch.norm(
+                            self.norm_cov(gt_cov.unsqueeze(0))
+                            - self.norm_cov(old_covs[c].unsqueeze(0))
+                        )
+                    )
+                    old_gauss = torch.distributions.MultivariateNormal(
+                        old_means[c], old_covs[c]
+                    )
+                    old_kld.append(
+                        torch.distributions.kl_divergence(old_gauss, gt_gauss)
+                        + torch.distributions.kl_divergence(gt_gauss, old_gauss)
+                    )
                     # Calculate new diffs
                     new_mean_diff.append((gt_mean - self.means[c]).norm())
                     new_cov_diff.append(torch.norm(gt_cov - self.covs[c]))
-                    new_cov_norm_diff.append(torch.norm(self.norm_cov(gt_cov.unsqueeze(0)) - self.norm_cov(self.covs[c].unsqueeze(0))))
-                    new_gauss = torch.distributions.MultivariateNormal(self.means[c], self.covs[c])
-                    new_kld.append(torch.distributions.kl_divergence(new_gauss, gt_gauss) + torch.distributions.kl_divergence(gt_gauss, new_gauss))
+                    new_cov_norm_diff.append(
+                        torch.norm(
+                            self.norm_cov(gt_cov.unsqueeze(0))
+                            - self.norm_cov(self.covs[c].unsqueeze(0))
+                        )
+                    )
+                    new_gauss = torch.distributions.MultivariateNormal(
+                        self.means[c], self.covs[c]
+                    )
+                    new_kld.append(
+                        torch.distributions.kl_divergence(new_gauss, gt_gauss)
+                        + torch.distributions.kl_divergence(gt_gauss, new_gauss)
+                    )
 
                 old_mean_diff = torch.stack(old_mean_diff)
                 old_cov_diff = torch.stack(old_cov_diff)
@@ -675,18 +925,30 @@ class Appr(Inc_Learning_Appr):
                 new_cov_diff = torch.stack(new_cov_diff)
                 new_cov_norm_diff = torch.stack(new_cov_norm_diff)
                 new_kld = torch.stack(new_kld)
-                print(f"Old {subset} mean diff: {old_mean_diff.mean():.2f} ± {old_mean_diff.std():.2f}")
-                print(f"New {subset} mean diff: {new_mean_diff.mean():.2f} ± {new_mean_diff.std():.2f}")
-                print(f"Old {subset} cov diff: {old_cov_diff.mean():.2f} ± {old_cov_diff.std():.2f}")
-                print(f"New {subset} cov diff: {new_cov_diff.mean():.2f} ± {new_cov_diff.std():.2f}")
-                print(f"Old {subset} norm-cov diff: {old_cov_norm_diff.mean():.2f} ± {old_cov_norm_diff.std():.2f}")
-                print(f"New {subset} norm-cov diff: {new_cov_norm_diff.mean():.2f} ± {new_cov_norm_diff.std():.2f}")
+                print(
+                    f"Old {subset} mean diff: {old_mean_diff.mean():.2f} ± {old_mean_diff.std():.2f}"
+                )
+                print(
+                    f"New {subset} mean diff: {new_mean_diff.mean():.2f} ± {new_mean_diff.std():.2f}"
+                )
+                print(
+                    f"Old {subset} cov diff: {old_cov_diff.mean():.2f} ± {old_cov_diff.std():.2f}"
+                )
+                print(
+                    f"New {subset} cov diff: {new_cov_diff.mean():.2f} ± {new_cov_diff.std():.2f}"
+                )
+                print(
+                    f"Old {subset} norm-cov diff: {old_cov_norm_diff.mean():.2f} ± {old_cov_norm_diff.std():.2f}"
+                )
+                print(
+                    f"New {subset} norm-cov diff: {new_cov_norm_diff.mean():.2f} ± {new_cov_norm_diff.std():.2f}"
+                )
                 print(f"Old {subset} KLD: {old_kld.mean():.2f} ± {old_kld.std():.2f}")
                 print(f"New {subset} KLD: {new_kld.mean():.2f} ± {new_kld.std():.2f}")
                 print("")
 
     def distill_projected(self, t, loss, features, distiller, images):
-        """ Projected distillation through the distiller, like in https://arxiv.org/abs/2308.12112"""
+        """Projected distillation through the distiller, like in https://arxiv.org/abs/2308.12112"""
         if t == 0:
             return loss, 0
         with torch.no_grad():
@@ -696,7 +958,7 @@ class Appr(Inc_Learning_Appr):
         return total_loss, kd_loss
 
     def distill_features(self, t, loss, features, images):
-        """ Feature distillation performed in the latent space of the feature extractor """
+        """Feature distillation performed in the latent space of the feature extractor"""
         if t == 0:
             return loss, 0
         with torch.no_grad():
@@ -706,7 +968,7 @@ class Appr(Inc_Learning_Appr):
         return total_loss, kd_loss
 
     def distill_logits(self, t, loss, features, images, old_heads):
-        """ Logit distillation like in LwF method"""
+        """Logit distillation like in LwF method"""
         if t == 0:
             return loss, 0
         with torch.no_grad():
@@ -719,28 +981,40 @@ class Appr(Inc_Learning_Appr):
 
     def get_optimizer(self, parameters, t, wd):
         """Returns the optimizer"""
-        milestones = (int(0.3*self.nepochs), int(0.6*self.nepochs), int(0.9*self.nepochs))
+        milestones = (
+            int(0.3 * self.nepochs),
+            int(0.6 * self.nepochs),
+            int(0.9 * self.nepochs),
+        )
         lr = self.lr
         if t > 0 and not self.pretrained:
             lr *= 0.1
         optimizer = torch.optim.SGD(parameters, lr=lr, weight_decay=wd, momentum=0.9)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=0.1)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer=optimizer, milestones=milestones, gamma=0.1
+        )
         return optimizer, scheduler
 
     def get_adapter_optimizer(self, parameters, milestones=(30, 60, 90)):
         """Returns the optimizer"""
-        optimizer = torch.optim.SGD(parameters, lr=self.lr_adapter, weight_decay=5e-4, momentum=0.9)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=0.1)
+        optimizer = torch.optim.SGD(
+            parameters, lr=self.lr_adapter, weight_decay=5e-4, momentum=0.9
+        )
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer=optimizer, milestones=milestones, gamma=0.1
+        )
         return optimizer, scheduler
 
     def get_pseudo_head_optimizer(self, parameters, milestones=(15,)):
         optimizer = torch.optim.SGD(parameters, lr=0.1, weight_decay=5e-4, momentum=0.9)
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=0.1)
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer=optimizer, milestones=milestones, gamma=0.1
+        )
         return optimizer, scheduler
 
     @torch.no_grad()
     def eval(self, t, val_loader):
-        """ Perform classification using mahalanobis distance OR nearest mean OR linear head. """
+        """Perform classification using mahalanobis distance OR nearest mean OR linear head."""
         self.model.eval()
         tag_acc = Accuracy("multiclass", num_classes=self.means.shape[0])
         taw_acc = Accuracy("multiclass", num_classes=self.classes_in_tasks[t])
@@ -751,11 +1025,18 @@ class Appr(Inc_Learning_Appr):
             if self.classifier == "linear":
                 logits = self.pseudo_head(features)
                 tag_preds = torch.argmax(logits, dim=1)
-                taw_preds = torch.argmax(logits[:, offset: offset + self.classes_in_tasks[t]], dim=1) + offset
+                taw_preds = (
+                    torch.argmax(
+                        logits[:, offset : offset + self.classes_in_tasks[t]], dim=1
+                    )
+                    + offset
+                )
             else:
                 if self.classifier == "bayes":  # Calcualte mahalanobis distances
                     if self.is_normalization:
-                        diff = F.normalize(features.unsqueeze(1), p=2, dim=-1) - F.normalize(self.means.unsqueeze(0), p=2, dim=-1)
+                        diff = F.normalize(
+                            features.unsqueeze(1), p=2, dim=-1
+                        ) - F.normalize(self.means.unsqueeze(0), p=2, dim=-1)
                     else:
                         diff = features.unsqueeze(1) - self.means.unsqueeze(0)
                     res = diff.unsqueeze(2) @ self.covs_inverted.unsqueeze(0)
@@ -764,7 +1045,12 @@ class Appr(Inc_Learning_Appr):
                 else:  # Euclidean
                     dist = torch.cdist(features, self.means)
                 tag_preds = torch.argmin(dist, dim=1)
-                taw_preds = torch.argmin(dist[:, offset: offset + self.classes_in_tasks[t]], dim=1) + offset
+                taw_preds = (
+                    torch.argmin(
+                        dist[:, offset : offset + self.classes_in_tasks[t]], dim=1
+                    )
+                    + offset
+                )
 
             tag_acc.update(tag_preds.cpu(), target)
             taw_acc.update(taw_preds.cpu(), target)
@@ -772,13 +1058,15 @@ class Appr(Inc_Learning_Appr):
         return 0, float(taw_acc.compute()), float(tag_acc.compute())
 
     def train_linear_head(self, t):
-        """ This is alternative to Bayes and NMC classifier """
+        """This is alternative to Bayes and NMC classifier"""
         distributions = []
         for c in range(self.means.shape[0]):
             cov = self.covs[c].clone()
             distributions.append(MultivariateNormal(self.means[c], cov))
         dataset = SampledDataset(distributions, 10000, self.task_offset)
-        trn_loader = torch.utils.data.DataLoader(dataset, batch_size=128, num_workers=0, shuffle=True)
+        trn_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=128, num_workers=0, shuffle=True
+        )
         # Train the adapter
         head = nn.Linear(self.S, self.task_offset[-1])
         head = head.to(self.device)
@@ -817,8 +1105,14 @@ class Appr(Inc_Learning_Appr):
                     logits_per_class = torch.cat((logits_per_class, logits), dim=0)
 
             logits_per_task = []
-            for i in range(t+1):
-                logits_per_task.append(float(logits_per_class[:, self.task_offset[i]:self.task_offset[i+1]].mean()))
+            for i in range(t + 1):
+                logits_per_task.append(
+                    float(
+                        logits_per_class[
+                            :, self.task_offset[i] : self.task_offset[i + 1]
+                        ].mean()
+                    )
+                )
 
             print(f"Logits per task: {list(logits_per_task)}")
 
@@ -831,16 +1125,23 @@ class Appr(Inc_Learning_Appr):
                 train_images = self.train_data_loaders[i].dataset.images
                 ds = ClassDirectoryDataset(train_images, val_loader.dataset.transform)
             else:
-                ds = ClassMemoryDataset(self.train_data_loaders[i].dataset.images, val_loader.dataset.transform)
+                ds = ClassMemoryDataset(
+                    self.train_data_loaders[i].dataset.images,
+                    val_loader.dataset.transform,
+                )
 
-            loader = torch.utils.data.DataLoader(ds, batch_size=256, num_workers=val_loader.num_workers, shuffle=False)
+            loader = torch.utils.data.DataLoader(
+                ds, batch_size=256, num_workers=val_loader.num_workers, shuffle=False
+            )
             from_ = 0
-            class_features = torch.full((len(ds), self.S), fill_value=-999999999.0, device=self.device)
+            class_features = torch.full(
+                (len(ds), self.S), fill_value=-999999999.0, device=self.device
+            )
             for images in loader:
                 bsz = images.shape[0]
                 images = images.to(self.device, non_blocking=True)
                 features = self.model(images)
-                class_features[from_: from_ + bsz] = features
+                class_features[from_ : from_ + bsz] = features
                 from_ += bsz
 
             cov = torch.cov(class_features.T)
@@ -857,14 +1158,16 @@ class Appr(Inc_Learning_Appr):
             print(f"Task {t}: {explained_by}")
 
     @torch.no_grad()
-    def shrink_cov(self, cov, alpha1=1., alpha2=0.):
-        if alpha2 == -1.:
-            return cov + alpha1 * torch.eye(cov.shape[0], device=self.device)  # ordinary epsilon
+    def shrink_cov(self, cov, alpha1=1.0, alpha2=0.0):
+        if alpha2 == -1.0:
+            return cov + alpha1 * torch.eye(
+                cov.shape[0], device=self.device
+            )  # ordinary epsilon
         diag_mean = torch.mean(torch.diagonal(cov))
         iden = torch.eye(cov.shape[0], device=self.device)
         mask = iden == 0.0
         off_diag_mean = torch.mean(cov[mask])
-        return cov + (alpha1*diag_mean*iden) + (alpha2*off_diag_mean*(1-iden))
+        return cov + (alpha1 * diag_mean * iden) + (alpha2 * off_diag_mean * (1 - iden))
 
     @torch.no_grad()
     def norm_cov(self, cov):
@@ -894,7 +1197,9 @@ class Appr(Inc_Learning_Appr):
         self.model.eval()
         print("### Norms per task: ###")
         gt_means, gt_covs, gt_inverted_covs = [], [], []
-        class_images = np.concatenate([dl.dataset.images for dl in self.train_data_loaders])
+        class_images = np.concatenate(
+            [dl.dataset.images for dl in self.train_data_loaders]
+        )
         labels = np.concatenate([dl.dataset.labels for dl in self.train_data_loaders])
 
         # Calculate ground truth
@@ -905,17 +1210,23 @@ class Appr(Inc_Learning_Appr):
                 train_images = list(compress(class_images, train_indices))
                 ds = ClassDirectoryDataset(train_images, val_loader.dataset.transform)
             else:
-                ds = ClassMemoryDataset(class_images[train_indices], val_loader.dataset.transform)
-            loader = torch.utils.data.DataLoader(ds, batch_size=128, num_workers=trn_loader.num_workers, shuffle=False)
+                ds = ClassMemoryDataset(
+                    class_images[train_indices], val_loader.dataset.transform
+                )
+            loader = torch.utils.data.DataLoader(
+                ds, batch_size=128, num_workers=trn_loader.num_workers, shuffle=False
+            )
             from_ = 0
-            class_features = torch.full((2 * len(ds), self.S), fill_value=0., device=self.device)
+            class_features = torch.full(
+                (2 * len(ds), self.S), fill_value=0.0, device=self.device
+            )
             for images in loader:
                 bsz = images.shape[0]
                 images = images.to(self.device, non_blocking=True)
                 features = self.model(images)
-                class_features[from_: from_ + bsz] = features
+                class_features[from_ : from_ + bsz] = features
                 features = self.model(torch.flip(images, dims=(3,)))
-                class_features[from_ + bsz: from_ + 2 * bsz] = features
+                class_features[from_ + bsz : from_ + 2 * bsz] = features
                 from_ += 2 * bsz
 
             gt_means.append(class_features.mean(0))
@@ -934,12 +1245,34 @@ class Appr(Inc_Learning_Appr):
         for task in range(len(self.task_offset[1:])):
             from_ = self.task_offset[task]
             to_ = self.task_offset[task + 1]
-            mean_norms.append(round(float(torch.norm(self.means[from_:to_], dim=1).mean()), 2))
-            cov_norms.append(round(float(torch.linalg.matrix_norm(self.covs[from_:to_]).mean()), 2))
-            inverted_cov_norms.append(round(float(torch.linalg.matrix_norm(torch.inverse(self.covs[from_:to_])).mean()), 2))  # no shrink, no norm!
-            gt_mean_norms.append(round(float(torch.norm(gt_means[from_:to_], dim=1).mean()), 2))
-            gt_cov_norms.append(round(float(torch.linalg.matrix_norm(gt_covs[from_:to_]).mean()), 2))
-            gt_inverted_cov_norms.append(round(float(torch.linalg.matrix_norm(gt_inverted_covs[from_:to_]).mean()), 2))
+            mean_norms.append(
+                round(float(torch.norm(self.means[from_:to_], dim=1).mean()), 2)
+            )
+            cov_norms.append(
+                round(float(torch.linalg.matrix_norm(self.covs[from_:to_]).mean()), 2)
+            )
+            inverted_cov_norms.append(
+                round(
+                    float(
+                        torch.linalg.matrix_norm(
+                            torch.inverse(self.covs[from_:to_])
+                        ).mean()
+                    ),
+                    2,
+                )
+            )  # no shrink, no norm!
+            gt_mean_norms.append(
+                round(float(torch.norm(gt_means[from_:to_], dim=1).mean()), 2)
+            )
+            gt_cov_norms.append(
+                round(float(torch.linalg.matrix_norm(gt_covs[from_:to_]).mean()), 2)
+            )
+            gt_inverted_cov_norms.append(
+                round(
+                    float(torch.linalg.matrix_norm(gt_inverted_covs[from_:to_]).mean()),
+                    2,
+                )
+            )
         print(f"Means: {mean_norms}")
         print(f"GT Means: {gt_mean_norms}")
         print(f"Covs: {cov_norms}")
@@ -950,7 +1283,9 @@ class Appr(Inc_Learning_Appr):
     @torch.no_grad()
     def print_mahalanobis(self, t):
         self.model.eval()
-        mahalanobis_per_class = torch.zeros((0, self.means.shape[0]), device=self.device)
+        mahalanobis_per_class = torch.zeros(
+            (0, self.means.shape[0]), device=self.device
+        )
         for val_loader in self.val_data_loaders:
             for images, targets in val_loader:
                 images = images.to(self.device, non_blocking=True)
@@ -963,10 +1298,17 @@ class Appr(Inc_Learning_Appr):
                 mahalanobis_per_class = torch.cat((mahalanobis_per_class, dist), dim=0)
 
         mahalanobis_per_task = []
-        for i in range(t+1):
-            mahalanobis_per_task.append(float(mahalanobis_per_class[:, self.task_offset[i]:self.task_offset[i+1]].mean()))
+        for i in range(t + 1):
+            mahalanobis_per_task.append(
+                float(
+                    mahalanobis_per_class[
+                        :, self.task_offset[i] : self.task_offset[i + 1]
+                    ].mean()
+                )
+            )
 
         print(f"Mahalanobis per task: {list(mahalanobis_per_task)}")
+
 
 def compute_rotations(images, targets, total_classes):
     # compute self-rotation for the first task following PASS https://github.com/Impression2805/CVPR21_PASS
@@ -1026,11 +1368,12 @@ def sup_con_loss(features, labels=None, mask=None, temperature=0.1):
     loss = loss.mean()
     return loss
 
+
 def loss_ac(features, beta):
     cov = torch.cov(features.T)
     cholesky = torch.linalg.cholesky(cov)
     cholesky_diag = torch.diag(cholesky)
-    loss = - torch.clamp(cholesky_diag, max=beta).mean()
+    loss = -torch.clamp(cholesky_diag, max=beta).mean()
     # if bool(torch.isinf(loss)) or bool(torch.isnan(loss)):
     #     return torch.tensor(7777.), torch.tensor(0.)
     return loss, torch.det(cov)
