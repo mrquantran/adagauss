@@ -378,17 +378,20 @@ class Appr(Inc_Learning_Appr):
                 features = self.model(images)
 
                 # =========== Contrastive loss ===========
-                old_means = self.means[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
-                old_covs = self.covs[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
-                con_loss = self.contrastive_loss(
-                    current_features=features,
-                    current_labels=targets,
-                    old_means=old_means,
-                    old_covs=old_covs,
-                    task_id=t,
-                    temperature=0.1,
-                    num_samples_per_old_class=self.num_samples_per_old_class
-                    )
+                # old_means = self.means[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                # old_covs = self.covs[:self.task_offset[t]] if t > 0 else torch.tensor([], device=self.device)
+                # con_loss = self.contrastive_loss(
+                #     current_features=features,
+                #     current_labels=targets,
+                #     old_means=old_means,
+                #     old_covs=old_covs,
+                #     task_id=t,
+                #     temperature=0.1,
+                #     num_samples_per_old_class=self.num_samples_per_old_class
+                #     )
+
+                # =========== Supervised contrastive loss ===========
+                con_loss = sup_con_loss(features, labels=targets, temperature=self.temperature)
 
                 if epoch < int(self.nepochs * 0.01):
                     features = features.detach()
