@@ -87,9 +87,7 @@ class Appr(Inc_Learning_Appr):
         multiplier=32,
         classifier="bayes",
         lambda_contr=0.5,
-        lambda_contr_adapter=0.1,
         min_k=20,
-        reconstruction_error_threshold=0.01,
     ):
         super(Appr, self).__init__(
             model,
@@ -124,9 +122,7 @@ class Appr(Inc_Learning_Appr):
         self.smoothing = smoothing
         self.adaptation_strategy = adaptation_strategy
         self.lambda_contr = lambda_contr
-        self.lambda_contr_adapter = lambda_contr_adapter
         self.min_k = min_k  # minimum rank
-        self.reconstruction_error_threshold = reconstruction_error_threshold
         self.old_model = None
         self.pretrained = pretrained_net
 
@@ -197,9 +193,7 @@ class Appr(Inc_Learning_Appr):
         parser.add_argument("--dump", help="Save checkpoints", action="store_true", default=False)
         parser.add_argument("--rotation", help="Rotate images in first task", action="store_true", default=False)
         parser.add_argument("--lambda-contr", help="Weight of contrastive loss", type=float, default=0.5)
-        parser.add_argument("--lambda-contr-adapter", help="Weight of contrastive loss", type=float, default=0.1)
         parser.add_argument("--min-k", help="Minimum rank for low-rank approximation", type=int, default=20)
-        parser.add_argument("--reconstruction-error-threshold", help="Threshold for dynamic rank selection", type=float, default=0.01)
         return parser.parse_known_args(args)
 
     def train_loop(self, t, trn_loader, val_loader):
@@ -293,6 +287,7 @@ class Appr(Inc_Learning_Appr):
                     ac, det = loss_ac(features, self.beta)
                     total_loss += self.alpha * ac
 
+                # Combine losses
                 total_loss += self.lambda_contr * contr_loss
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
@@ -347,6 +342,9 @@ class Appr(Inc_Learning_Appr):
                 f"Singularity: {train_ac:.3f} Det: {train_determinant:.5f} Val: {valid_loss:.2f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}"
             )
 
+        if self.distillation == "logit":
+            self.heads.append(criterion.head)
+
     def sample_past_tasks(self, bsz, t=0):
         """Sample pseudo-prototypes from past tasks"""
         past_targets = torch.randint(0, self.task_offset[t], (bsz,), device=self.device)
@@ -362,19 +360,11 @@ class Appr(Inc_Learning_Appr):
     def contrastive_loss(self, features, targets, temperature=0.5, eps=1e-8):
         features = F.normalize(features, dim=1)
         sim = torch.mm(features, features.T) / temperature
-        sim = torch.clamp(sim, min=-10, max=10)
+        sim = torch.clamp(sim, min=-10, max=10)  # Prevent overflow
         mask = (targets.unsqueeze(0) == targets.unsqueeze(1)).float()
         mask -= torch.eye(mask.shape[0], device=self.device)
-
-        # Compute task weights based on target offsets
-        task_ids = torch.zeros_like(targets)
-        for task, offset in enumerate(self.task_offset[:-1]):
-            task_ids[targets >= offset] = task
-        weights = torch.exp(-0.5 * (task_ids.unsqueeze(0) - task_ids.unsqueeze(1)).abs())
-        weights = weights * mask
-
         exp_sim = torch.exp(sim)
-        pos = torch.sum(exp_sim * weights, dim=1)
+        pos = torch.sum(exp_sim * mask, dim=1)
         neg = torch.sum(exp_sim, dim=1) - exp_sim.diag()
         loss = -torch.log((pos + eps) / (pos + neg + eps))
         return loss.mean()
@@ -412,18 +402,10 @@ class Appr(Inc_Learning_Appr):
             cov = torch.cov(class_features.T)
             cov = self.shrink_cov(cov, self.shrink)
             U, S, _ = torch.linalg.svd(cov, full_matrices=False)
-
-            # Dynamic rank selection based on reconstruction error
-            k = 1
-            threshold = self.reconstruction_error_threshold * (1 / (1 + 0.1 * t))
-            while k < len(S):
-                cov_approx = U[:, :k] @ torch.diag(S[:k]) @ U[:, :k].T
-                error = torch.norm(cov - cov_approx, p="fro") / torch.norm(cov, p="fro")
-                if error <= threshold:
-                    break
-                k += 1
+            total_var = torch.sum(S)
+            cum_var = torch.cumsum(S, dim=0)
+            k = torch.searchsorted(cum_var, self.sval_fraction * total_var).item() + 1
             k = max(k, self.min_k)  # Ensure minimum rank
-
             U_c = U[:, :k] @ torch.diag(torch.sqrt(S[:k]))
             new_U_factors.append(U_c)
             new_k_values.append(k)
@@ -447,12 +429,6 @@ class Appr(Inc_Learning_Appr):
         adapter.to(self.device, non_blocking=True)
         optimizer, lr_scheduler = self.get_adapter_optimizer(adapter.parameters())
 
-        # Create pseudo-prototypes for past tasks
-        if t > 0:
-            past_samples, past_targets = self.sample_past_tasks(trn_loader.batch_size * 10, t)
-            past_samples = past_samples.to(self.device)
-            past_targets = past_targets.to(self.device)
-
         for epoch in range(self.nepochs // 2):
             adapter.train()
             train_loss, valid_loss = [], []
@@ -466,20 +442,6 @@ class Appr(Inc_Learning_Appr):
                     old_features = self.old_model(images)
                 adapted_features = adapter(old_features)
                 loss = F.mse_loss(adapted_features, target)
-
-                if t > 0:
-                    # Sample pseudo-prototypes for past tasks
-                    indices = torch.randint(0, past_samples.shape[0], (bsz,))
-                    past_batch_samples = past_samples[indices]
-                    past_batch_targets = past_targets[indices]
-                    adapted_past_samples = adapter(past_batch_samples)
-
-                    # Use contrastive loss on past samples to preserve discriminability
-                    all_features = torch.cat([adapted_features, adapted_past_samples], dim=0)
-                    all_targets = torch.cat([torch.arange(bsz, device=self.device), past_batch_targets], dim=0)
-                    contr_loss = self.contrastive_loss(all_features, all_targets)
-                    loss += self.lambda_contr_adapter * contr_loss
-
                 ac, det = 0, torch.tensor(0)
                 if self.alpha > 0:
                     ac, det = loss_ac(adapted_features, self.beta)
@@ -532,18 +494,6 @@ class Appr(Inc_Learning_Appr):
                         cov_adapted = torch.diag(torch.diag(cov_adapted))
                     U, S, _ = torch.linalg.svd(cov_adapted, full_matrices=False)
                     cum_var = torch.cumsum(S, dim=0)
-
-                    # Dynamic rank selection for adapted covariance
-                    k_new = 1
-                    threshold = self.reconstruction_error_threshold * (1 / (1 + 0.1 * t))
-                    while k_new < len(S):
-                        cov_approx = U[:, :k_new] @ torch.diag(S[:k_new]) @ U[:, :k_new].T
-                        error = torch.norm(cov_adapted - cov_approx, p='fro') / torch.norm(cov_adapted, p='fro')
-                        if error <= threshold:
-                            break
-                        k_new += 1
-                    k_new = max(k_new, self.min_k)
-
                     k_new = max(torch.searchsorted(cum_var, self.sval_fraction * torch.sum(S)).item() + 1, self.min_k)
                     U_c_new = U[:, :k_new] @ torch.diag(torch.sqrt(S[:k_new]))
                     self.U_factors[c] = U_c_new
