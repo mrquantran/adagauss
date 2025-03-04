@@ -272,6 +272,7 @@ class Appr(Inc_Learning_Appr):
                     total_loss += self.gamma * ccr_loss
                 else:
                     ccr_loss = self.sup_con_loss(features, labels=targets)
+                    total_loss += self.gamma * ccr_loss
 
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
