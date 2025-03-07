@@ -7,6 +7,7 @@ import numpy as np
 from argparse import ArgumentParser
 from itertools import compress
 from torch import nn
+import torch.utils
 from torch.utils.data import Dataset
 from torchmetrics import Accuracy
 
@@ -38,20 +39,29 @@ class SampledDataset(torch.utils.data.Dataset):
 
 class PseudoPrototypeDataset(torch.utils.data.Dataset):
     """Dataset for generating pseudo-prototypes from memorized distributions"""
-    def __init__(self, distributions, samples_per_class):
+    def __init__(self, distributions, samples_per_class, device='cuda'):
         self.distributions = distributions
         self.samples_per_class = samples_per_class
         self.total_classes = len(distributions)
+        self.device = device
         self.data = []
         self.labels = []
         for c in range(self.total_classes):
-            # Move mean and covariance to CPU for sampling
-            mean_cpu = self.distributions[c].loc.cpu()
-            cov_cpu = self.distributions[c].covariance_matrix.cpu()
-            dist_cpu = MultivariateNormal(mean_cpu, cov_cpu)
-            samples = dist_cpu.sample((samples_per_class,))
+            mean = self.distributions[c].loc.to(self.device)
+            cov = self.distributions[c].covariance_matrix.to(self.device)
+            try:
+                # Attempt GPU sampling
+                dist = MultivariateNormal(mean, cov)
+                samples = dist.sample((samples_per_class,)).to(self.device)
+            except Exception as e:
+                # Fallback to CPU sampling if GPU fails
+                print(f"Warning: GPU sampling failed for class {c}: {e}. Falling back to CPU.")
+                mean_cpu = mean.cpu()
+                cov_cpu = cov.cpu()
+                dist_cpu = MultivariateNormal(mean_cpu, cov_cpu)
+                samples = dist_cpu.sample((samples_per_class,)).to(self.device)
             self.data.append(samples)
-            self.labels.append(torch.full((samples_per_class,), c, dtype=torch.long))
+            self.labels.append(torch.full((samples_per_class,), c, dtype=torch.long, device=self.device))
         self.data = torch.cat(self.data, dim=0)
         self.labels = torch.cat(self.labels, dim=0)
 
@@ -232,8 +242,8 @@ class Appr(Inc_Learning_Appr):
         pseudo_loader = None
         if t > 0:
             distributions = [MultivariateNormal(self.means[c], self.covs[c]) for c in range(self.means.shape[0])]
-            pseudo_dataset = PseudoPrototypeDataset(distributions, self.samples_per_class)
-            pseudo_loader = torch.utils.data.DataLoader(pseudo_dataset, batch_size=128, shuffle=True, num_workers=trn_loader.num_workers)
+            pseudo_dataset = PseudoPrototypeDataset(distributions, self.samples_per_class, device=self.device)
+            pseudo_loader = torch.utils.data.DataLoader(pseudo_dataset, batch_size=1024, shuffle=True)
 
         for epoch in range(self.nepochs):
             train_loss, train_kd_loss, valid_loss, valid_kd_loss, valid_ccr_loss = [], [], [], [], []
@@ -266,13 +276,11 @@ class Appr(Inc_Learning_Appr):
                     ac, det = loss_ac(features, self.beta)
                     total_loss += self.alpha * ac
 
-                # Add CCR loss if t > 0
                 if t > 0 and pseudo_loader is not None:
                     ccr_loss = self.contrastive_covariance_loss(features, targets, pseudo_loader)
                     total_loss += self.gamma * ccr_loss
                 else:
-                    ccr_loss = self.sup_con_loss(features, labels=targets)
-                    total_loss += self.gamma * ccr_loss
+                    ccr_loss = 0
 
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
@@ -328,8 +336,10 @@ class Appr(Inc_Learning_Appr):
             train_acc = train_hits / train_total
             val_acc = val_hits / val_total
 
-            print(f"Epoch: {epoch} CCR: {train_ccr:.2f} Train: {train_loss:.2f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
-                  f"Val: {valid_loss:.2f} CCR: {valid_ccr_loss:.3f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}")
+            print(
+                f"Epoch: {epoch} CCR: {train_ccr:.2f} Train: {train_loss:.2f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
+                f"Val: {valid_loss:.2f} CCR: {valid_ccr_loss:.3f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}"
+            )
 
         if self.distillation == "logit":
             self.heads.append(criterion.head)
@@ -389,7 +399,7 @@ class Appr(Inc_Learning_Appr):
             exp_logits * negatives_mask, axis=1, keepdims=True) + torch.sum(
             exp_logits * positives_mask, axis=1, keepdims=True)
 
-        log_probs = logits - torch.log(denominator)
+        log_probs = logits - torch.log(denominator + 1e-8)
         if torch.any(torch.isnan(log_probs)):
             raise ValueError("Log_prob has nan!")
 
