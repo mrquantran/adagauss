@@ -198,7 +198,7 @@ def get_transforms(resize, test_resize, pad, crop, flip, normalize, extend_chann
 
     trn_transform_list = []
     tst_transform_list = []
-    
+
     # resize
     if resize is not None:
         trn_transform_list.append(transforms.Resize(resize))
@@ -293,11 +293,11 @@ def get_transforms(resize, test_resize, pad, crop, flip, normalize, extend_chann
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ]
-      
+
     # to tensor
     # trn_transform_list.append(transforms.ToTensor())
     # tst_transform_list.append(transforms.ToTensor())
-   
+
     # normalization
     # if normalize is not None:
     #     trn_transform_list.append(transforms.Normalize(mean=normalize[0], std=normalize[1]))
@@ -330,10 +330,10 @@ def _ensure_imagenet_subset_prepared(path):
     ds_conf = dataset_config['imagenet_subset_kaggle']
     clsss2idx = {c:i for i, c in enumerate(ds_conf['lbl_order'])}
     print(f'Generating train/test splits for ImageNet-Subset directory: {path}')
-    def prepare_split(split='train', outfile='train.txt'):    
+    def prepare_split(split='train', outfile='train.txt'):
         with open(f"{path}/{outfile}", 'wt') as f:
             for fn in glob.glob(f"{path}/data/{split}/*/*"):
-                c = fn.split('/')[-2]    
+                c = fn.split('/')[-2]
                 lbl = clsss2idx[c]
                 relative_path = fn.replace(f"{path}/", '')
                 f.write(f"{relative_path} {lbl}\n")
