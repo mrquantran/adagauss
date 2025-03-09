@@ -71,15 +71,42 @@ class PseudoPrototypeDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         return self.data[index], self.labels[index]
 
+class AttentionModule(nn.Module):
+    def __init__(self, feature_dim):
+        super(AttentionModule, self).__init__()
+        self.fc = nn.Linear(feature_dim, feature_dim)
+
+    def forward(self, old_features):
+        """Compute dimension-wise scaling factors based on old features."""
+        scaling_factors = torch.sigmoid(self.fc(old_features))
+        return scaling_factors
+
+class AttentionAdapter(nn.Module):
+    def __init__(self, feature_dim, multiplier):
+        super(AttentionAdapter, self).__init__()
+        self.attention = AttentionModule(feature_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, multiplier * feature_dim),
+            nn.GELU(),
+            nn.Linear(multiplier * feature_dim, feature_dim)
+        )
+
+    def forward(self, old_features):
+        """Adapt old features using attention-based scaling."""
+        scaling_factors = self.attention(old_features)
+        adjustments = self.mlp(old_features)
+        adapted_features = old_features + scaling_factors * adjustments
+        return adapted_features
+
 class Appr(Inc_Learning_Appr):
-    """Class implementing AdaGauss algorithm with Contrastive Covariance Regularization (CCR)"""
+    """Class implementing AdaGauss algorithm with Contrastive Covariance Regularization (CCR) and Inter-Class Separation Regularization"""
 
     def __init__(self, model, device, nepochs=200, lr=0.05, lr_min=1e-4, lr_factor=3, lr_patience=5, clipgrad=1,
                  momentum=0, wd=0, multi_softmax=False, wu_nepochs=0, wu_lr_factor=1, nnet="resnet18", patience=5, fix_bn=False, eval_on_train=False,
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False,
                  rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
                  adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes",
-                 gamma=0.1, temperature=0.07, samples_per_class=10):
+                 gamma=0.1, temperature=0.07, samples_per_class=10, sep_gamma=0.1, margin=10.0):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -102,6 +129,8 @@ class Appr(Inc_Learning_Appr):
         self.gamma = gamma  # Weight for CCR loss
         self.temperature = temperature  # Temperature for contrastive loss
         self.samples_per_class = samples_per_class  # Number of pseudo-prototypes per class
+        self.sep_gamma = sep_gamma  # Weight for separation loss
+        self.margin = margin  # Margin for hinge loss in separation regularization
 
         if nnet == "vit":
             state_dict = torch.load("dino_deitsmall16_pretrain.pth")
@@ -160,7 +189,7 @@ class Appr(Inc_Learning_Appr):
         parser.add_argument('--sval-fraction', help='Fraction of eigenvalues sum that is explained', type=float, default=0.95)
         parser.add_argument('--adaptation-strategy', help='Activation functions in resnet', type=str, choices=["none", "mean", "diag", "full"], default="full")
         parser.add_argument('--distiller', help='Distiller', type=str, choices=["linear", "mlp"], default="mlp")
-        parser.add_argument('--adapter', help='Adapter', type=str, choices=["linear", "mlp"], default="mlp")
+        parser.add_argument('--adapter', help='Adapter', type=str, choices=["linear", "mlp", "attention"], default="attention")
         parser.add_argument('--criterion', help='Loss function', type=str, choices=["ce", "proxy-nca", "proxy-yolo"], default="ce")
         parser.add_argument('--nnet', help='Type of neural network', type=str, choices=["vit", "resnet18", "resnet32"], default="resnet18")
         parser.add_argument('--classifier', help='Classifier type', type=str, choices=["linear", "bayes", "nmc"], default="bayes")
@@ -174,6 +203,8 @@ class Appr(Inc_Learning_Appr):
         parser.add_argument('--gamma', help='Weight of CCR loss', type=float, default=0.1)
         parser.add_argument('--temperature', help='Temperature for contrastive loss', type=float, default=0.07)
         parser.add_argument('--samples-per-class', help='Number of pseudo-prototypes per class', type=int, default=10)
+        parser.add_argument('--sep-gamma', help='Weight of separation loss', type=float, default=0.05)
+        parser.add_argument('--margin', help='Margin for separation loss', type=float, default=10.0)
         return parser.parse_known_args(args)
 
     def train_loop(self, t, trn_loader, val_loader):
@@ -203,11 +234,6 @@ class Appr(Inc_Learning_Appr):
         if self.is_normalization:
             covs = self.norm_cov(covs)
         self.covs_inverted = torch.inverse(covs)
-
-        self.check_singular_values(t, val_loader)
-        self.print_singular_values()
-        self.print_covs(trn_loader, val_loader)
-        self.print_mahalanobis(t)
 
     def train_backbone(self, t, trn_loader, val_loader, num_classes_in_t):
         trn_loader = torch.utils.data.DataLoader(trn_loader.dataset, batch_size=trn_loader.batch_size, num_workers=trn_loader.num_workers, shuffle=True, drop_last=True)
@@ -245,10 +271,16 @@ class Appr(Inc_Learning_Appr):
             pseudo_dataset = PseudoPrototypeDataset(distributions, self.samples_per_class, device=self.device)
             pseudo_loader = torch.utils.data.DataLoader(pseudo_dataset, batch_size=1024, shuffle=True)
 
+        # Initialize running means and covariances for new classes
+        if t > 0:
+            new_class_means = torch.zeros((num_classes_in_t, self.S), device=self.device, requires_grad=False)
+            new_class_covs = torch.zeros((num_classes_in_t, self.S, self.S), device=self.device, requires_grad=False)
+            new_class_counts = torch.zeros(num_classes_in_t, device=self.device)
+
         for epoch in range(self.nepochs):
             train_loss, train_kd_loss, valid_loss, valid_kd_loss, valid_ccr_loss = [], [], [], [], []
             train_ac, train_determinant = [], []
-            train_ccr = []
+            train_ccr, train_sep_loss = [], []
             train_hits, val_hits, train_total, val_total = 0, 0, 0, 0
             self.model.train()
             criterion.train()
@@ -282,6 +314,27 @@ class Appr(Inc_Learning_Appr):
                 else:
                     ccr_loss = 0
 
+                if t > 0:
+                    with torch.no_grad():
+                        for c in range(num_classes_in_t):
+                            class_mask = (targets == c)
+                            if class_mask.any():
+                                class_features = features[class_mask].detach()
+                                batch_mean = class_features.mean(dim=0)
+                                batch_cov = torch.cov(class_features.T) if class_features.shape[0] > 1 else torch.zeros((self.S, self.S), device=self.device)
+                                count = class_features.shape[0]
+                                new_class_counts[c] += count
+                                delta = batch_mean - new_class_means[c]
+                                new_class_means[c] += delta * (count / new_class_counts[c])
+                                if class_features.shape[0] > 1:
+                                    new_class_covs[c] = ((new_class_counts[c] - 1) * new_class_covs[c] + (count - 1) * batch_cov) / (new_class_counts[c] + count - 2)
+
+                if t > 0:
+                    sep_loss = self.compute_separation_loss(t, num_classes_in_t, new_class_means, new_class_covs)
+                    total_loss += self.sep_gamma * sep_loss
+                else:
+                    sep_loss = 0
+
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
                 optimizer.step()
@@ -292,6 +345,7 @@ class Appr(Inc_Learning_Appr):
                 train_ac.append(float(ac))
                 train_determinant.append(float(torch.clamp(torch.abs(det), max=1e8)))
                 train_kd_loss.append(float(bsz * kd_loss))
+                train_sep_loss.append(float(bsz * sep_loss))
             lr_scheduler.step()
 
             val_total = 1e-8
@@ -328,6 +382,7 @@ class Appr(Inc_Learning_Appr):
             train_loss = sum(train_loss) / train_total
             train_kd_loss = sum(train_kd_loss) / train_total
             train_ccr = sum(train_ccr) / train_total
+            train_sep_loss = sum(train_sep_loss) / train_total
             train_determinant = sum(train_determinant) / len(train_determinant)
             valid_loss = sum(valid_loss) / val_total
             valid_kd_loss = sum(valid_kd_loss) / val_total
@@ -337,12 +392,112 @@ class Appr(Inc_Learning_Appr):
             val_acc = val_hits / val_total
 
             print(
-                f"Epoch: {epoch} CCR: {train_ccr:.2f} Train: {train_loss:.2f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
+                f"Epoch: {epoch} CCR: {train_ccr:.2f} Sep Loss: {train_sep_loss:.5f} Train: {train_loss:.2f} KD: {train_kd_loss:.3f} Acc: {100 * train_acc:.2f} Singularity: {train_ac:.3f} Det: {train_determinant:.5f} "
                 f"Val: {valid_loss:.2f} CCR: {valid_ccr_loss:.3f} KD: {valid_kd_loss:.3f} Acc: {100 * val_acc:.2f}"
             )
 
         if self.distillation == "logit":
             self.heads.append(criterion.head)
+
+    # def compute_separation_loss(self, t, num_classes_in_t, new_class_means, new_class_covs):
+    #     """Compute the inter-class separation loss."""
+    #     margin = self.margin
+    #     sep_loss = 0.0
+    #     total_pairs = 0
+
+    #     # All classes: old + new
+    #     all_means = torch.cat((self.means, new_class_means), dim=0)
+    #     all_covs = torch.cat((self.covs, new_class_covs), dim=0)
+
+    #     for i in range(all_means.shape[0]):
+    #         for j in range(i + 1, all_means.shape[0]):
+    #             d_ij_squared = self.mahalanobis_squared(all_means[i], all_means[j], all_covs[i], all_covs[j])
+    #             sep_loss += torch.relu(margin - d_ij_squared)
+    #             total_pairs += 1
+
+    #     if total_pairs > 0:
+    #         sep_loss /= total_pairs
+    #     return sep_loss
+
+    def compute_separation_loss(self, t, num_classes_in_t, new_class_means, new_class_covs):
+        """Compute the inter-class separation loss using a pooled covariance matrix and vectorized operations."""
+        margin = self.margin
+        sep_loss = 0.0
+
+        # All classes: old + new
+        all_means = torch.cat((self.means, new_class_means), dim=0)
+        all_covs = torch.cat((self.covs, new_class_covs), dim=0)
+        num_classes = all_means.shape[0]
+
+        # Compute pooled covariance
+        pooled_cov = torch.mean(all_covs, dim=0)
+
+        # Add small epsilon to diagonal for numerical stability
+        epsilon = 1e-6
+        pooled_cov += epsilon * torch.eye(self.S, device=self.device)
+
+        # Compute inverse of pooled covariance
+        M = torch.inverse(pooled_cov)
+
+        # Compute A = all_means @ M @ all_means.T
+        A = all_means @ M @ all_means.T
+
+        # Compute diagonal of A
+        diag_A = torch.diag(A)
+
+        # Compute pairwise squared distances
+        distances = diag_A.unsqueeze(0) + diag_A.unsqueeze(1) - 2 * A
+
+        # Get upper triangle (i < j)
+        upper_tri = torch.triu(distances, diagonal=1)
+
+        # Compute separation loss
+        sep_loss = torch.sum(torch.relu(margin - upper_tri))
+
+        # Number of pairs
+        total_pairs = num_classes * (num_classes - 1) / 2
+
+        if total_pairs > 0:
+            sep_loss /= total_pairs
+        else:
+            sep_loss = 0.0
+
+        return sep_loss
+
+    def mahalanobis_squared(self, mu_i, mu_j, cov_i, cov_j):
+        """Compute squared Mahalanobis distance between mu_i and mu_j with averaged covariance."""
+        sigma_ij = (cov_i + cov_j) / 2
+        diff = mu_i - mu_j
+        try:
+            sigma_ij_inv = torch.inverse(sigma_ij)
+        except RuntimeError:
+            # If inversion fails, add a small epsilon to the diagonal
+            epsilon = 1e-6
+            sigma_ij += epsilon * torch.eye(sigma_ij.shape[0], device=self.device)
+            sigma_ij_inv = torch.inverse(sigma_ij)
+        distance = diff @ sigma_ij_inv @ diff
+        return distance
+
+    def compute_dynamic_temperature(self, all_features, all_labels):
+        # Compute normalized features
+        features_norm = F.normalize(all_features, p=2, dim=1)
+        batch_size = features_norm.shape[0]
+        labels = all_labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(self.device)
+
+        # Compute similarities
+        similarity = torch.matmul(features_norm, features_norm.T)
+        pos_mask = mask * (torch.ones_like(mask) - torch.eye(batch_size).to(self.device))
+        neg_mask = 1. - mask
+        pos_similarity = (similarity * pos_mask).sum() / (pos_mask.sum() + 1e-8)
+        neg_similarity = (similarity * neg_mask).sum() / (neg_mask.sum() + 1e-8)
+
+        # Dynamic temperature
+        base_temp = self.temperature
+        dynamic_temp = base_temp * (1 + (pos_similarity - neg_similarity))
+        dynamic_temp = torch.clamp(dynamic_temp, min=0.05, max=0.5)
+
+        return dynamic_temp
 
     def contrastive_covariance_loss(self, features, targets, pseudo_loader):
         """Compute the Contrastive Covariance Regularization (CCR) loss"""
@@ -360,12 +515,14 @@ class Appr(Inc_Learning_Appr):
         all_features = torch.cat([features, pseudo_features], dim=0)
         all_labels = torch.cat([targets, pseudo_labels], dim=0)
 
+        dynamic_temp = self.compute_dynamic_temperature(all_features, all_labels)
+
         # Compute loss
-        ccr_loss = self.sup_con_loss(all_features, temperature=self.temperature, labels=all_labels)
+        ccr_loss = self.sup_con_loss(all_features, temperature=dynamic_temp, labels=all_labels)
 
         return ccr_loss
 
-    def sup_con_loss(self, features, temperature=0.1, labels=None, mask=None):
+    def sup_con_loss(self, features, temperature=0.07, labels=None, mask=None):
         device = (torch.device('cuda') if features.is_cuda else torch.device('cpu'))
         features_norm = F.normalize(features, p=2, dim=1)
         batch_size = features_norm.shape[0]
@@ -462,6 +619,10 @@ class Appr(Inc_Learning_Appr):
                                     nn.GELU(),
                                     nn.Linear(self.multiplier * self.S, self.S)
                                     )
+
+        if self.adapter_type == "attention":
+            adapter = AttentionAdapter(self.S, self.multiplier)
+
         adapter.to(self.device, non_blocking=True)
         optimizer, lr_scheduler = self.get_adapter_optimizer(adapter.parameters())
         old_means = copy.deepcopy(self.means)
@@ -532,73 +693,6 @@ class Appr(Inc_Learning_Appr):
                     if self.adaptation_strategy == "diag":
                         self.covs[c] = torch.diag(torch.diag(self.covs[c]))
 
-            print("### Adaptation evaluation ###")
-            for (subset, loaders) in [("train", self.train_data_loaders), ("val", self.val_data_loaders)]:
-                old_mean_diff, new_mean_diff = [], []
-                old_kld, new_kld = [], []
-                old_cov_diff, old_cov_norm_diff, new_cov_diff, new_cov_norm_diff = [], [], [], []
-                class_images = np.concatenate([dl.dataset.images for dl in loaders[-2:-1]])
-                labels = np.concatenate([dl.dataset.labels for dl in loaders[-2:-1]])
-
-                for c in list(np.unique(labels)):
-                    train_indices = torch.tensor(labels) == c
-
-                    if isinstance(trn_loader.dataset.images, list):
-                        train_images = list(compress(class_images, train_indices))
-                        ds = ClassDirectoryDataset(train_images, val_loader.dataset.transform)
-                    else:
-                        ds = ClassMemoryDataset(class_images[train_indices], val_loader.dataset.transform)
-                    loader = torch.utils.data.DataLoader(ds, batch_size=128, num_workers=trn_loader.num_workers, shuffle=False)
-                    from_ = 0
-                    class_features = torch.full((2 * len(ds), self.S), fill_value=0., device=self.device)
-                    for images in loader:
-                        bsz = images.shape[0]
-                        images = images.to(self.device, non_blocking=True)
-                        features = self.model(images)
-                        class_features[from_: from_+bsz] = features
-                        features = self.model(torch.flip(images, dims=(3,)))
-                        class_features[from_+bsz: from_+2*bsz] = features
-                        from_ += 2*bsz
-
-                    gt_mean = class_features.mean(0)
-                    gt_cov = torch.cov(class_features.T)
-                    gt_cov = self.shrink_cov(gt_cov, self.shrink)
-                    gt_gauss = torch.distributions.MultivariateNormal(gt_mean, gt_cov)
-                    if self.adaptation_strategy == "diag":
-                        gt_cov = torch.diag(torch.diag(gt_cov))
-
-                    # Calculate old diffs
-                    old_mean_diff.append((gt_mean - old_means[c]).norm())
-                    old_cov_diff.append(torch.norm(gt_cov - old_covs[c]))
-                    old_cov_norm_diff.append(torch.norm(self.norm_cov(gt_cov.unsqueeze(0)) - self.norm_cov(old_covs[c].unsqueeze(0))))
-                    old_gauss = torch.distributions.MultivariateNormal(old_means[c], old_covs[c])
-                    old_kld.append(torch.distributions.kl_divergence(old_gauss, gt_gauss) + torch.distributions.kl_divergence(gt_gauss, old_gauss))
-                    # Calculate new diffs
-                    new_mean_diff.append((gt_mean - self.means[c]).norm())
-                    new_cov_diff.append(torch.norm(gt_cov - self.covs[c]))
-                    new_cov_norm_diff.append(torch.norm(self.norm_cov(gt_cov.unsqueeze(0)) - self.norm_cov(self.covs[c].unsqueeze(0))))
-                    new_gauss = torch.distributions.MultivariateNormal(self.means[c], self.covs[c])
-                    new_kld.append(torch.distributions.kl_divergence(new_gauss, gt_gauss) + torch.distributions.kl_divergence(gt_gauss, new_gauss))
-
-                old_mean_diff = torch.stack(old_mean_diff)
-                old_cov_diff = torch.stack(old_cov_diff)
-                old_cov_norm_diff = torch.stack(old_cov_norm_diff)
-                old_kld = torch.stack(old_kld)
-
-                new_mean_diff = torch.stack(new_mean_diff)
-                new_cov_diff = torch.stack(new_cov_diff)
-                new_cov_norm_diff = torch.stack(new_cov_norm_diff)
-                new_kld = torch.stack(new_kld)
-                print(f"Old {subset} mean diff: {old_mean_diff.mean():.2f} ± {old_mean_diff.std():.2f}")
-                print(f"New {subset} mean diff: {new_mean_diff.mean():.2f} ± {new_mean_diff.std():.2f}")
-                print(f"Old {subset} cov diff: {old_cov_diff.mean():.2f} ± {old_cov_diff.std():.2f}")
-                print(f"New {subset} cov diff: {new_cov_diff.mean():.2f} ± {new_cov_diff.std():.2f}")
-                print(f"Old {subset} norm-cov diff: {old_cov_norm_diff.mean():.2f} ± {old_cov_norm_diff.std():.2f}")
-                print(f"New {subset} norm-cov diff: {new_cov_norm_diff.mean():.2f} ± {new_cov_norm_diff.std():.2f}")
-                print(f"Old {subset} KLD: {old_kld.mean():.2f} ± {old_kld.std():.2f}")
-                print(f"New {subset} KLD: {new_kld.mean():.2f} ± {new_kld.std():.2f}")
-                print("")
-
     def distill_projected(self, t, loss, features, distiller, images):
         """ Projected distillation through the distiller, like in https://arxiv.org/abs/2308.12112"""
         if t == 0:
@@ -664,40 +758,6 @@ class Appr(Inc_Learning_Appr):
         return 0, float(taw_acc.compute()), float(tag_acc.compute())
 
     @torch.no_grad()
-    def check_singular_values(self, t, val_loader):
-        self.model.eval()
-        self.svals_explained_by.append([])
-        for i, _ in enumerate(self.train_data_loaders):
-            if isinstance(self.train_data_loaders[i].dataset.images, list):
-                train_images = self.train_data_loaders[i].dataset.images
-                ds = ClassDirectoryDataset(train_images, val_loader.dataset.transform)
-            else:
-                ds = ClassMemoryDataset(self.train_data_loaders[i].dataset.images, val_loader.dataset.transform)
-
-            loader = torch.utils.data.DataLoader(ds, batch_size=256, num_workers=val_loader.num_workers, shuffle=False)
-            from_ = 0
-            class_features = torch.full((len(ds), self.S), fill_value=-999999999.0, device=self.device)
-            for images in loader:
-                bsz = images.shape[0]
-                images = images.to(self.device, non_blocking=True)
-                features = self.model(images)
-                class_features[from_: from_ + bsz] = features
-                from_ += bsz
-
-            cov = torch.cov(class_features.T)
-            svals = torch.linalg.svdvals(cov)
-            xd = torch.cumsum(svals, 0)
-            xd = xd[xd < self.sval_fraction * torch.sum(svals)]
-            explain = xd.shape[0]
-            self.svals_explained_by[t].append(explain)
-
-    @torch.no_grad()
-    def print_singular_values(self):
-        print(f"### {self.sval_fraction} of eigenvalues sum is explained by: ###")
-        for t, explained_by in enumerate(self.svals_explained_by):
-            print(f"Task {t}: {explained_by}")
-
-    @torch.no_grad()
     def shrink_cov(self, cov, alpha1=1., alpha2=0.):
         if alpha2 == -1.:
             return cov + alpha1 * torch.eye(cov.shape[0], device=self.device)  # ordinary epsilon
@@ -713,85 +773,6 @@ class Appr(Inc_Learning_Appr):
         std = torch.sqrt(diag)
         cov = cov / (std.unsqueeze(2) @ std.unsqueeze(1))
         return cov
-
-    @torch.no_grad()
-    def print_covs(self, trn_loader, val_loader):
-        self.model.eval()
-        print("### Norms per task: ###")
-        gt_means, gt_covs, gt_inverted_covs = [], [], []
-        class_images = np.concatenate([dl.dataset.images for dl in self.train_data_loaders])
-        labels = np.concatenate([dl.dataset.labels for dl in self.train_data_loaders])
-
-        # Calculate ground truth
-        for c in list(np.unique(labels)):
-            train_indices = torch.tensor(labels) == c
-
-            if isinstance(trn_loader.dataset.images, list):
-                train_images = list(compress(class_images, train_indices))
-                ds = ClassDirectoryDataset(train_images, val_loader.dataset.transform)
-            else:
-                ds = ClassMemoryDataset(class_images[train_indices], val_loader.dataset.transform)
-            loader = torch.utils.data.DataLoader(ds, batch_size=128, num_workers=trn_loader.num_workers, shuffle=False)
-            from_ = 0
-            class_features = torch.full((2 * len(ds), self.S), fill_value=0., device=self.device)
-            for images in loader:
-                bsz = images.shape[0]
-                images = images.to(self.device, non_blocking=True)
-                features = self.model(images)
-                class_features[from_: from_ + bsz] = features
-                features = self.model(torch.flip(images, dims=(3,)))
-                class_features[from_ + bsz: from_ + 2 * bsz] = features
-                from_ += 2 * bsz
-
-            gt_means.append(class_features.mean(0))
-            cov = torch.cov(class_features.T)
-            gt_covs.append(cov)
-            gt_inverted_covs.append(torch.inverse(self.shrink_cov(cov, self.shrink)))
-
-        gt_means = torch.stack(gt_means)
-        gt_covs = torch.stack(gt_covs)
-        gt_inverted_covs = torch.stack(gt_inverted_covs)
-
-        # Calculate statistics per task
-        mean_norms, cov_norms = [], []
-        gt_mean_norms, gt_cov_norms = [], []
-        inverted_cov_norms, gt_inverted_cov_norms = [], []
-        for task in range(len(self.task_offset[1:])):
-            from_ = self.task_offset[task]
-            to_ = self.task_offset[task + 1]
-            mean_norms.append(round(float(torch.norm(self.means[from_:to_], dim=1).mean()), 2))
-            cov_norms.append(round(float(torch.linalg.matrix_norm(self.covs[from_:to_]).mean()), 2))
-            inverted_cov_norms.append(round(float(torch.linalg.matrix_norm(torch.inverse(self.covs[from_:to_])).mean()), 2))  # no shrink, no norm!
-            gt_mean_norms.append(round(float(torch.norm(gt_means[from_:to_], dim=1).mean()), 2))
-            gt_cov_norms.append(round(float(torch.linalg.matrix_norm(gt_covs[from_:to_]).mean()), 2))
-            gt_inverted_cov_norms.append(round(float(torch.linalg.matrix_norm(gt_inverted_covs[from_:to_]).mean()), 2))
-        print(f"Means: {mean_norms}")
-        print(f"GT Means: {gt_mean_norms}")
-        print(f"Covs: {cov_norms}")
-        print(f"GT Covs: {gt_cov_norms}")
-        print(f"Inverted Covs: {inverted_cov_norms}")
-        print(f"GT Inverted Covs: {gt_inverted_cov_norms}")
-
-    @torch.no_grad()
-    def print_mahalanobis(self, t):
-        self.model.eval()
-        mahalanobis_per_class = torch.zeros((0, self.means.shape[0]), device=self.device)
-        for val_loader in self.val_data_loaders:
-            for images, targets in val_loader:
-                images = images.to(self.device, non_blocking=True)
-                features = self.model(images)
-
-                diff = features.unsqueeze(1) - self.means.unsqueeze(0)
-                res = diff.unsqueeze(2) @ self.covs_inverted.unsqueeze(0)
-                res = res @ diff.unsqueeze(3)
-                dist = res.squeeze(2).squeeze(2)
-                mahalanobis_per_class = torch.cat((mahalanobis_per_class, dist), dim=0)
-
-        mahalanobis_per_task = []
-        for i in range(t+1):
-            mahalanobis_per_task.append(float(mahalanobis_per_class[:, self.task_offset[i]:self.task_offset[i+1]].mean()))
-
-        print(f"Mahalanobis per task: {list(mahalanobis_per_task)}")
 
 def compute_rotations(images, targets, total_classes):
     # compute self-rotation for the first task following PASS https://github.com/Impression2805/CVPR21_PASS
