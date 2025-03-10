@@ -20,7 +20,9 @@ from .criterions.proxy_yolo import ProxyYolo
 from .criterions.ce import CE
 
 from torch.distributions.multivariate_normal import MultivariateNormal
-
+from sklearn.manifold import TSNE
+import datetime
+import matplotlib.pyplot as plt
 
 class SampledDataset(torch.utils.data.Dataset):
     """ Dataset that samples pseudo prototypes from memorized distributions to train pseudo head """
@@ -667,6 +669,52 @@ class Appr(Inc_Learning_Appr):
             tag_acc.update(tag_preds.cpu(), target)
             taw_acc.update(taw_preds.cpu(), target)
 
+            # t-SNE visualization
+        if self.dump:
+            all_features = []
+            all_targets = []
+            for loader in self.val_data_loaders[: t + 1]:
+                for images, target in loader:
+                    images = images.to(self.device, non_blocking=True)
+                    features = self.model(images)
+                    all_features.append(features.cpu())
+                    all_targets.append(target)
+            all_features = torch.cat(all_features, dim=0)
+            all_targets = torch.cat(all_targets, dim=0)
+
+            if not torch.isfinite(all_features).all():
+                print(
+                    "Warning: Features contain non-finite values. Skipping t-SNE visualization."
+                )
+            else:
+                print(f"Performing t-SNE visualization after task {t}...")
+                tsne = TSNE(n_components=2, random_state=42)
+                features_2d = tsne.fit_transform(all_features.numpy())
+
+                plt.figure(figsize=(10, 8))
+                scatter = plt.scatter(
+                    features_2d[:, 0],
+                    features_2d[:, 1],
+                    c=all_targets.numpy(),
+                    cmap="tab10",
+                    alpha=1.0,
+                )
+                plt.colorbar(scatter)
+                plt.title(f"t-SNE Visualization After Task {t}")
+
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                plot_path = f"{self.logger.exp_path}/tsne_after_task_{t}_timeline_{timestamp}_nepochs_{self.nepochs}.png"
+                print(f"Saving t-SNE plot to: {plot_path}")
+                if not os.path.exists(self.logger.exp_path):
+                    print(f"Directory does not exist, creating: {self.logger.exp_path}")
+                    os.makedirs(self.logger.exp_path, exist_ok=True)
+                plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+                if os.path.exists(plot_path):
+                    print(f"Plot saved successfully: {plot_path}")
+                else:
+                    print(f"Failed to save plot: {plot_path}")
+                plt.close()
+
         return 0, float(taw_acc.compute()), float(tag_acc.compute())
 
     def train_linear_head(self, t):
@@ -719,8 +767,6 @@ class Appr(Inc_Learning_Appr):
                 logits_per_task.append(float(logits_per_class[:, self.task_offset[i]:self.task_offset[i+1]].mean()))
 
             print(f"Logits per task: {list(logits_per_task)}")
-
-
 
     @torch.no_grad()
     def check_singular_values(self, t, val_loader):

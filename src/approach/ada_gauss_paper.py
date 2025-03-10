@@ -21,6 +21,10 @@ from .criterions.proxy_yolo import ProxyYolo
 from .criterions.ce import CE
 
 from torch.distributions.multivariate_normal import MultivariateNormal
+import os
+from sklearn.manifold import TSNE
+import datetime
+import matplotlib.pyplot as plt
 
 class SampledDataset(torch.utils.data.Dataset):
     """ Dataset that samples pseudo prototypes from memorized distributions to train pseudo head """
@@ -106,7 +110,7 @@ class Appr(Inc_Learning_Appr):
                  logger=None, N=10000, alpha=1., lr_backbone=0.01, lr_adapter=0.01, beta=1., distillation="projected", use_224=False, S=64, dump=False,
                  rotation=False, distiller="linear", adapter="linear", criterion="proxy-nca", lamb=10, tau=2, smoothing=0., sval_fraction=0.95,
                  adaptation_strategy="full", pretrained_net=False, normalize=False, shrink=0., multiplier=32, classifier="bayes",
-                 gamma=0.1, temperature=0.07, samples_per_class=10, sep_gamma=0.1, margin=10.0):
+                 gamma=0.1, temperature=0.07, samples_per_class=10, sep_gamma=10, margin=10.0):
         super(Appr, self).__init__(model, device, nepochs, lr, lr_min, lr_factor, lr_patience, clipgrad, momentum, wd,
                                    multi_softmax, wu_nepochs, wu_lr_factor, fix_bn, eval_on_train, logger,
                                    exemplars_dataset=None)
@@ -198,12 +202,12 @@ class Appr(Inc_Learning_Appr):
         parser.add_argument('--use-224', help='Additional max pool and different conv1 in Resnet18', action='store_true', default=False)
         parser.add_argument('--pretrained-net', help='Load pretrained weights', action='store_true', default=False)
         parser.add_argument('--normalize', help='normalize features and covariance matrices', action='store_true', default=False)
-        parser.add_argument('--dump', help='save checkpoints', action='store_true', default=False)
+        parser.add_argument('--dump', help='save checkpoints', action='store_true', default=True)
         parser.add_argument('--rotation', help='Rotate images in the first task to enhance feature extractor', action='store_true', default=False)
         parser.add_argument('--gamma', help='Weight of CCR loss', type=float, default=0.1)
         parser.add_argument('--temperature', help='Temperature for contrastive loss', type=float, default=0.07)
         parser.add_argument('--samples-per-class', help='Number of pseudo-prototypes per class', type=int, default=10)
-        parser.add_argument('--sep-gamma', help='Weight of separation loss', type=float, default=0.05)
+        parser.add_argument('--sep-gamma', help='Weight of separation loss', type=float, default=10)
         parser.add_argument('--margin', help='Margin for separation loss', type=float, default=10.0)
         return parser.parse_known_args(args)
 
@@ -726,11 +730,13 @@ class Appr(Inc_Learning_Appr):
 
     @torch.no_grad()
     def eval(self, t, val_loader):
-        """ Perform classification using mahalanobis distance OR nearest mean OR linear head. """
+        """Perform classification using Mahalanobis distance OR nearest mean OR linear head, and generate t-SNE visualization."""
         self.model.eval()
         tag_acc = Accuracy("multiclass", num_classes=self.means.shape[0])
         taw_acc = Accuracy("multiclass", num_classes=self.classes_in_tasks[t])
         offset = self.task_offset[t]
+
+        # Existing evaluation loop
         for images, target in val_loader:
             images = images.to(self.device, non_blocking=True)
             features = self.model(images)
@@ -739,7 +745,7 @@ class Appr(Inc_Learning_Appr):
                 tag_preds = torch.argmax(logits, dim=1)
                 taw_preds = torch.argmax(logits[:, offset: offset + self.classes_in_tasks[t]], dim=1) + offset
             else:
-                if self.classifier == "bayes":  # Calculate mahalanobis distances
+                if self.classifier == "bayes":  # Calculate Mahalanobis distances
                     if self.is_normalization:
                         diff = F.normalize(features.unsqueeze(1), p=2, dim=-1) - F.normalize(self.means.unsqueeze(0), p=2, dim=-1)
                     else:
@@ -754,6 +760,44 @@ class Appr(Inc_Learning_Appr):
 
             tag_acc.update(tag_preds.cpu(), target)
             taw_acc.update(taw_preds.cpu(), target)
+
+        # t-SNE visualization
+        if self.dump:
+            all_features = []
+            all_targets = []
+            for loader in self.val_data_loaders[:t+1]:
+                for images, target in loader:
+                    images = images.to(self.device, non_blocking=True)
+                    features = self.model(images)
+                    all_features.append(features.cpu())
+                    all_targets.append(target)
+            all_features = torch.cat(all_features, dim=0)
+            all_targets = torch.cat(all_targets, dim=0)
+
+            if not torch.isfinite(all_features).all():
+                print("Warning: Features contain non-finite values. Skipping t-SNE visualization.")
+            else:
+                print(f'Performing t-SNE visualization after task {t}...')
+                tsne = TSNE(n_components=2, random_state=42)
+                features_2d = tsne.fit_transform(all_features.numpy())
+
+                plt.figure(figsize=(10, 8))
+                scatter = plt.scatter(features_2d[:, 0], features_2d[:, 1], c=all_targets.numpy(), cmap='tab10', alpha=1.0)
+                plt.colorbar(scatter)
+                plt.title(f't-SNE Visualization After Task {t}')
+
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                plot_path = f'{self.logger.exp_path}/tsne_after_task_{t}_timeline_{timestamp}_nepochs_{self.nepochs}.png'
+                print(f"Saving t-SNE plot to: {plot_path}")
+                if not os.path.exists(self.logger.exp_path):
+                    print(f"Directory does not exist, creating: {self.logger.exp_path}")
+                    os.makedirs(self.logger.exp_path, exist_ok=True)
+                plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+                if os.path.exists(plot_path):
+                    print(f"Plot saved successfully: {plot_path}")
+                else:
+                    print(f"Failed to save plot: {plot_path}")
+                plt.close()
 
         return 0, float(taw_acc.compute()), float(tag_acc.compute())
 
